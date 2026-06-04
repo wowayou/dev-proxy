@@ -1,0 +1,8 @@
+﻿{
+    "proxyHost":  "127.0.0.1",
+    "proxyPort":  20122,
+    "proxyScheme":  "http",
+    "noProxy":  "localhost,127.0.0.1,::1,.local",
+    "distro":  "Ubuntu-24.04",
+    "enableWslMirrored":  true
+}

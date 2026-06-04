@@ -1,0 +1,50 @@
+# OS and editor noise
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.swp
+*.swo
+*.tmp
+*.temp
+*.bak
+*.orig
+*~
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# Logs and runtime output
+*.log
+logs/
+*.pid
+*.pid.lock
+
+# PowerShell artifacts
+*.ps1xml
+*.pssc
+*.psrc
+*.psd1.tmp
+
+# Test and tool caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+coverage/
+
+# Node/package manager caches, if docs tooling is added locally
+node_modules/
+.npm/
+.pnpm-store/
+
+# Local-only config variants
+config.local.json
+config.*.local.json
+
+# Generated archives and release bundles
+*.zip
+*.tar
+*.tar.gz
+*.tgz
