@@ -155,3 +155,6 @@ Run:
 ```
 
 Rollback disables the Windows user system proxy, clears the user-level proxy environment variables, resets WinHTTP when PowerShell is elevated, and comments out the WSL profile source line. Existing provider credentials and app-specific configs are not touched.
+
+## Contact
+Contact me in [linux.do](https://linux.do/): https://linux.do/u/wowayou/summary
