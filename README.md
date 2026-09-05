@@ -67,7 +67,9 @@ Rollback:
 
 ## Configuration
 
-`config.json` stores the local target and WSL preference:
+`config.json` stores the local target and WSL preference. It holds per-machine
+settings, so it is not tracked in git; `config.example.json` is the tracked
+template:
 
 ```json
 {
@@ -75,10 +77,20 @@ Rollback:
   "proxyPort": 20122,
   "proxyScheme": "http",
   "noProxy": "localhost,127.0.0.1,::1,.local",
-  "distro": "Ubuntu-24.04",
+  "distro": null,
   "enableWslMirrored": true
 }
 ```
+
+A fresh clone has no `config.json`. The tool falls back to the values above and
+writes the file on its first run, so nothing needs to be copied by hand. Copy
+the template only if you want to pre-seed values:
+
+```powershell
+Copy-Item .\config.example.json .\config.json
+```
+
+`distro` is filled in by menu option 3 or by passing `-Distro`.
 
 `enableWslMirrored` is a visible user preference. The menu header shows it, options 1 and 4 both let you change it, and both save the answer back to `config.json`. `noProxy` feeds the CLI bypass variables and the Windows system-proxy bypass list; entries that start with a dot, such as `.local`, are rewritten to the `*.local` form WinINet expects. Values are validated on load, so an out-of-range port or an unknown scheme falls back to the default with a warning instead of being written to the registry. In `-NonInteractive` mode, `.wslconfig` mirrored settings are applied only when this value is `true`; the WSL shell proxy environment is still installed either way.
 

@@ -39,7 +39,9 @@ node_modules/
 .npm/
 .pnpm-store/
 
-# Local-only config variants
+# Local-only config variants. config.json holds per-machine settings the tool
+# regenerates on first run; config.example.json is the tracked template.
+config.json
 config.local.json
 config.*.local.json
 

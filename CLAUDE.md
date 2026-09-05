@@ -12,7 +12,7 @@ This is a standalone Windows and WSL ops tool. Maintain it in place at `C:\Users
 
 ## Editing Workflow
 
-1. Read `dev-proxy.ps1`, `config.json`, and `templates/wsl-proxy-env.sh` before changing behavior.
+1. Read `dev-proxy.ps1`, `config.example.json`, and `templates/wsl-proxy-env.sh` before changing behavior. `config.json` is per-machine state, is not tracked, and may be absent; keep `config.example.json` in step with `Get-DefaultConfig`.
 2. Preserve `enableWslMirrored` as a user-visible preference shown in the menu and saved to `config.json`.
 3. Preserve WSL helper commands: `proxy_status`, `proxy_refresh`, and `proxy_off`.
 4. Preserve dynamic NAT fallback through the WSL default-route gateway.
@@ -34,7 +34,7 @@ $tokens = $null
 $errors = $null
 [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path .\dev-proxy.ps1), [ref]$tokens, [ref]$errors) | Out-Null
 if ($errors) { $errors; exit 1 }
-Get-Content .\config.json -Raw | ConvertFrom-Json | Out-Null
+Get-Content .\config.example.json -Raw | ConvertFrom-Json | Out-Null
 .\dev-proxy.ps1 -NonInteractive -DryRun
 ```
 

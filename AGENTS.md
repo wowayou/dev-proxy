@@ -12,7 +12,8 @@ This directory is a standalone ops tool. Keep it decoupled from the `cc-switch` 
 
 ## Safe Edit Rules
 
-- Keep `dev-proxy.ps1`, `config.json`, `templates/wsl-proxy-env.sh`, and local docs self-contained.
+- Keep `dev-proxy.ps1`, `config.example.json`, `templates/wsl-proxy-env.sh`, and local docs self-contained.
+- `config.json` is per-machine state and is not tracked. Keep `config.example.json` in step with `Get-DefaultConfig`, and never commit a real `config.json`.
 - Preserve `enableWslMirrored` as a visible preference, not a hidden compatibility field.
 - Preserve WSL commands: `proxy_status`, `proxy_refresh`, and `proxy_off`.
 - Preserve dynamic NAT host detection. Use `DEV_PROXY_HOST_OVERRIDE` only as an intentional fixed-host override.
@@ -38,10 +39,11 @@ $errors = $null
 if ($errors) { $errors; exit 1 }
 ```
 
-JSON parse check:
+JSON parse check. `config.json` only exists after a first run, so check the tracked template too:
 
 ```powershell
-Get-Content .\config.json -Raw | ConvertFrom-Json | Out-Null
+Get-Content .\config.example.json -Raw | ConvertFrom-Json | Out-Null
+if (Test-Path .\config.json) { Get-Content .\config.json -Raw | ConvertFrom-Json | Out-Null }
 ```
 
 WSL template syntax check:
