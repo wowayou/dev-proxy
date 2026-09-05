@@ -213,6 +213,18 @@ $LASTEXITCODE
 `-Verify` and `-Disable` do not write `config.json`, so the throwaway port is
 not persisted. Confirm that by checking the file's timestamp afterwards.
 
+Cover the other way verification can fail: a WSL call that never runs at all.
+Naming a distro that does not exist must report the failure rather than fall
+through to a clean summary, which is what it used to do.
+
+```powershell
+.\dev-proxy.ps1 -Verify -Distro dev-proxy-validation-no-such-distro
+$LASTEXITCODE
+```
+
+Expect `[FAIL] WSL checks did not run ...` and exit code `1`. Every exit path
+in `dev-proxy.ps1` reports failures this way, rollback included.
+
 ### 6. WSL Helpers
 
 ```powershell

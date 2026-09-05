@@ -933,7 +933,7 @@ if (!$Verify -and !$Disable) { Save-Config $config }
 
 if ($Disable) {
     Disable-All $config
-    exit
+    exit ([int]($script:HadFailures))
 }
 
 if ($Verify) {
@@ -956,10 +956,11 @@ if ($NonInteractive) {
     }
     if ($DryRun) {
         Write-Info "Dry-run complete; verification skipped."
-        exit
+        exit ([int]($script:HadFailures))
     }
     Verify-All $config
     exit ([int]($script:HadFailures))
 }
 
 Show-Menu $config
+exit ([int]($script:HadFailures))

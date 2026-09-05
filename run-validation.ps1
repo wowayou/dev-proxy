@@ -288,6 +288,13 @@ if (-not $Full) {
         Add-Check "verification exits 1 on failure" ($unhealthy.ExitCode -eq 1) "port $deadPort, exit $($unhealthy.ExitCode)"
         Add-Check "-Verify does not write config.json" ((Get-Item $ConfigPath).LastWriteTimeUtc -eq $configBefore)
 
+        # Regression guard: a WSL call that never ran used to leave verification
+        # reporting no failures at all. -Verify does not save config.json, so
+        # naming a distro that does not exist changes nothing.
+        $noDistro = Invoke-DevProxy @("-Verify", "-Distro", "dev-proxy-validation-no-such-distro")
+        Add-Check "verification fails when WSL cannot run" ($noDistro.ExitCode -eq 1) "exit $($noDistro.ExitCode)"
+        Add-Check "WSL failure is reported, not skipped" ([bool]($noDistro.Text -match "WSL checks did not run"))
+
         Write-Section "6. WSL helpers"
 
         $statusLines = Invoke-WslScript $Distro "proxy_status`necho ---`nproxy_off`nproxy_status"
