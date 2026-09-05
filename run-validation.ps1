@@ -166,7 +166,8 @@ $badPort = Invoke-DevProxy @("-NonInteractive", "-DryRun", "-ProxyPort", "99999"
 Add-Check "rejects an out-of-range port" ([bool]($badPort.Text -match "is not in 1-65535"))
 
 if (-not $Full) {
-    Write-Section "Summary"
+    # No section header here; the summary below is the only one.
+    Write-Host ""
     Write-Host "Read-only checks only. Re-run with -Full to cover apply, verification exit codes, WSL helpers, and rollback." -ForegroundColor DarkCyan
 } else {
     if (-not $Distro -and (Test-Path $ConfigPath)) {
