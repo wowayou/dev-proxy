@@ -185,13 +185,17 @@ function ConvertTo-ProxyOverride([string]$NoProxy) {
     return ($parts -join ";")
 }
 
-function Get-ProxyEnvMap($Config) {
+function Get-ProxyEnvEntries($Config) {
+    # A hashtable would fold HTTP_PROXY and http_proxy into a single entry,
+    # because PowerShell compares its keys case-insensitively. Both spellings
+    # have to be written, so keep them as an ordered list of pairs.
     $proxy = Get-ProxyUrl $Config
-    $map = [ordered]@{}
+    $entries = @()
     foreach ($name in $ProxyEnvNames) {
-        $map[$name] = if ($name -ieq "NO_PROXY") { [string]$Config.noProxy } else { $proxy }
+        $value = if ($name -ieq "NO_PROXY") { [string]$Config.noProxy } else { $proxy }
+        $entries += [pscustomobject]@{ Name = $name; Value = $value }
     }
-    return $map
+    return $entries
 }
 
 function Test-IsAdmin {
@@ -247,11 +251,11 @@ function Clear-WindowsSystemProxy {
 }
 
 function Set-UserProxyEnv($Config) {
-    foreach ($entry in (Get-ProxyEnvMap $Config).GetEnumerator()) {
+    foreach ($entry in @(Get-ProxyEnvEntries $Config)) {
         if ($DryRun) {
-            Write-Info "Dry-run: would set user env $($entry.Key)=$($entry.Value)"
+            Write-Info "Dry-run: would set user env $($entry.Name)=$($entry.Value)"
         } else {
-            [Environment]::SetEnvironmentVariable($entry.Key, [string]$entry.Value, "User")
+            [Environment]::SetEnvironmentVariable($entry.Name, [string]$entry.Value, "User")
         }
     }
     if (!$DryRun) { Write-Ok "Windows user proxy environment variables updated" }
@@ -539,6 +543,22 @@ printf '%s' '__CONTENT_BASE64__' | base64 -d > "$HOME/.config/dev-proxy/proxy-en
 chmod 600 "$HOME/.config/dev-proxy/proxy-env.sh"
 touch "$HOME/.profile"
 SOURCE_LINE='source "$HOME/.config/dev-proxy/proxy-env.sh"'
+DISABLED_LINE="# disabled by dev-proxy: $SOURCE_LINE"
+
+# Re-enable a line this tool disabled earlier instead of appending a second
+# copy, which would leave the commented-out line behind for good.
+if grep -qxF "$DISABLED_LINE" "$HOME/.profile"; then
+  tmp="$(mktemp)"
+  while IFS= read -r line || [ -n "$line" ]; do
+    if [ "$line" = "$DISABLED_LINE" ]; then
+      printf '%s\n' "$SOURCE_LINE"
+    else
+      printf '%s\n' "$line"
+    fi
+  done < "$HOME/.profile" > "$tmp"
+  mv "$tmp" "$HOME/.profile"
+fi
+
 if ! grep -qxF "$SOURCE_LINE" "$HOME/.profile"; then
   {
     printf '\n# Dev proxy environment\n'
@@ -565,15 +585,24 @@ function Disable-WslProxyEnv($Config) {
     }
     $cmd = @'
 set -e
-if [ -f "$HOME/.profile" ]; then
-  cp "$HOME/.profile" "$HOME/.profile.dev-proxy.bak.$(date +%s)"
-  tmp="$(mktemp)"
-  awk '{ if ($0 == "source \"$HOME/.config/dev-proxy/proxy-env.sh\"") print "# disabled by dev-proxy: " $0; else print $0 }' "$HOME/.profile" > "$tmp"
-  mv "$tmp" "$HOME/.profile"
+SOURCE_LINE='source "$HOME/.config/dev-proxy/proxy-env.sh"'
+if [ ! -f "$HOME/.profile" ] || ! grep -qxF "$SOURCE_LINE" "$HOME/.profile"; then
+  # Nothing active to disable, so do not leave another backup behind.
+  printf 'already-disabled\n'
+  exit 0
 fi
+cp "$HOME/.profile" "$HOME/.profile.dev-proxy.bak.$(date +%s)"
+tmp="$(mktemp)"
+awk '{ if ($0 == "source \"$HOME/.config/dev-proxy/proxy-env.sh\"") print "# disabled by dev-proxy: " $0; else print $0 }' "$HOME/.profile" > "$tmp"
+mv "$tmp" "$HOME/.profile"
+printf 'disabled\n'
 '@
-    $output = Invoke-WslBash -Distro $Config.distro -Command $cmd
-    Write-WslCommandOutput $output
+    $parsed = Split-WslOutput (Invoke-WslBash -Distro $Config.distro -Command $cmd)
+    if ($parsed.Lines -contains "already-disabled") {
+        Write-Ok "WSL proxy source line was already disabled for $($Config.distro)"
+        return
+    }
+    Write-WslOutputLines $parsed
     Write-Ok "Disabled WSL proxy source line for $($Config.distro)"
 }
 
@@ -861,7 +890,9 @@ function Show-Menu($Config) {
 }
 
 $config = Read-Config
-Save-Config $config
+# -Verify and -Disable do not change the target, so they must not write one
+# either; otherwise a throwaway -ProxyPort would be saved to config.json.
+if (!$Verify -and !$Disable) { Save-Config $config }
 
 if ($Disable) {
     Disable-All $config

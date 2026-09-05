@@ -62,10 +62,14 @@ if (Test-Path .\config.json) { Get-Content .\config.json -Raw | ConvertFrom-Json
 if (Test-Path .\config.json) { '{0:X2}' -f [IO.File]::ReadAllBytes((Resolve-Path .\config.json))[0] }
 ```
 
-WSL template syntax check:
+WSL template syntax check. Resolve the path from the current directory so the
+check works from any checkout, and read the exit code rather than trusting a
+trailing string:
 
 ```powershell
-wsl.exe -- bash -lc "bash -n /mnt/c/Users/Public/ops-tools/dev-proxy/templates/wsl-proxy-env.sh"
+$sh = wsl.exe -- wslpath -u "$((Resolve-Path .\templates\wsl-proxy-env.sh).Path)"
+wsl.exe -- bash -n "$sh"
+if ($LASTEXITCODE -eq 0) { "bash -n ok" } else { "bash -n FAILED" }
 ```
 
 ### 2. Dry Run
@@ -119,6 +123,11 @@ instead of failing or elevating:
 Repeat once in an elevated shell to cover the other branch, where that step
 becomes `[ OK ] WinHTTP proxy imported ...`.
 
+If `.wslconfig` was changed, mirrored networking is not active until WSL
+restarts. Run `wsl --shutdown` after saving work in WSL before trusting steps 5
+and 6, otherwise expect `DEV_PROXY_HOST_SOURCE=nat-gateway` and
+`proxy_tcp=unreachable` from a proxy client bound to loopback only.
+
 Confirm what landed in the registry:
 
 ```powershell
@@ -161,11 +170,17 @@ PASS_OPENAI
 PASS_ANTHROPIC
 ```
 
-HTTP `401`, `403`, or `404` still counts as a pass. For the negative case, stop
-the local proxy client and re-run: expect `[FAIL]` lines, a
-`Verification finished with N failure(s)` summary, and exit code `1`. Do not
-force a failure by passing a different `-ProxyPort`; the main flow saves config
-before the `-Verify` branch, so that would persist the throwaway port.
+HTTP `401`, `403`, or `404` still counts as a pass. For the negative case, point
+the check at a port nothing listens on and expect `[FAIL]` lines, a
+`Verification finished with N failure(s)` summary, and exit code `1`:
+
+```powershell
+.\dev-proxy.ps1 -Verify -ProxyPort 20199
+$LASTEXITCODE
+```
+
+`-Verify` and `-Disable` do not write `config.json`, so the throwaway port is
+not persisted. Confirm that by checking the file's timestamp afterwards.
 
 ### 6. WSL Helpers
 
@@ -173,14 +188,21 @@ before the `-Verify` branch, so that would persist the throwaway port.
 wsl.exe -d Ubuntu-24.04 -- bash -lc "proxy_status; proxy_refresh; proxy_status; proxy_off; proxy_status"
 ```
 
-All three helpers must exist. After `proxy_off`, `DEV_PROXY_HOST_SOURCE` returns
-to `<unresolved>` and `HTTP_PROXY` to `<unset>`. With `enableWslMirrored` off and
-WSL restarted, the source must read `nat-gateway` rather than `mirrored-localhost`.
+All three helpers must exist. `DEV_PROXY_HOST_SOURCE` must agree with the host
+on the line above it: `mirrored-localhost` with `127.0.0.1`, `nat-gateway` with a
+vEthernet address such as `172.17.0.1`, `override` when `DEV_PROXY_HOST_OVERRIDE`
+is set, and `unresolved` only when no host was found at all. A resolved host
+reported as `unresolved` means the source is being assigned inside a subshell
+again. After `proxy_off`, both it and `HTTP_PROXY` return to their unset markers.
 
 ### 7. Rollback
 
+`-Disable` asks for confirmation and defaults to No, so pressing Enter aborts
+the rollback and leaves everything in place. Answer `y`, or pass
+`-NonInteractive` to skip the prompt:
+
 ```powershell
-.\dev-proxy.ps1 -Disable
+.\dev-proxy.ps1 -Disable -NonInteractive
 
 Get-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings" | Select-Object ProxyEnable
 [Environment]::GetEnvironmentVariable("HTTP_PROXY", "User")
@@ -188,7 +210,11 @@ wsl.exe -d Ubuntu-24.04 -- bash -lc "grep -n dev-proxy ~/.profile"
 ```
 
 `ProxyEnable` is `0`, the user variable is empty, and the profile source line is
-commented out rather than deleted.
+commented out rather than deleted. Running rollback twice must report
+`already disabled` and add no second `.profile.dev-proxy.bak.*` file, and a
+later install must re-enable that line rather than append a duplicate. Only
+lines this tool commented out are recognized; a source line disabled by hand
+with a different prefix is left alone and will produce a second entry.
 
 ### 8. Boundary Check
 

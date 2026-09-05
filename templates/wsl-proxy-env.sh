@@ -15,17 +15,24 @@ _dev_proxy_can_connect() {
   fi
 }
 
-_dev_proxy_windows_host() {
-  # Mirrored networking can use Windows localhost. NAT mode must use the WSL
-  # default gateway, which is the Windows vEthernet address and may change.
+_dev_proxy_resolve_host() {
+  # Sets DEV_PROXY_HOST_SOURCE and _dev_proxy_resolved_host in the caller's
+  # shell. It must not print the host for a "$(...)" capture: that runs in a
+  # subshell, so the source assignment would be discarded.
   if _dev_proxy_can_connect "127.0.0.1" "${DEV_PROXY_PORT}"; then
     DEV_PROXY_HOST_SOURCE="mirrored-localhost"
-    printf '%s\n' "127.0.0.1"
+    _dev_proxy_resolved_host="127.0.0.1"
     return 0
   fi
 
-  DEV_PROXY_HOST_SOURCE="nat-gateway"
-  ip route show default 2>/dev/null | awk 'NR==1 {print $3}'
+  # NAT mode cannot use Windows localhost, so fall back to the default gateway,
+  # which is the Windows vEthernet address and may change.
+  _dev_proxy_resolved_host="$(ip route show default 2>/dev/null | awk 'NR==1 {print $3}')"
+  if [ -n "${_dev_proxy_resolved_host}" ]; then
+    DEV_PROXY_HOST_SOURCE="nat-gateway"
+  else
+    DEV_PROXY_HOST_SOURCE="unresolved"
+  fi
 }
 
 proxy_on() {
@@ -35,10 +42,11 @@ proxy_on() {
     host="${DEV_PROXY_HOST_OVERRIDE}"
     DEV_PROXY_HOST_SOURCE="override"
   else
-    DEV_PROXY_HOST_SOURCE="unresolved"
-    host="$(_dev_proxy_windows_host)"
+    _dev_proxy_resolve_host
+    host="${_dev_proxy_resolved_host}"
   fi
   if [ -z "${host}" ]; then
+    DEV_PROXY_HOST_SOURCE="unresolved"
     printf 'dev-proxy: unable to resolve Windows proxy host\n' >&2
     return 1
   fi
@@ -57,13 +65,13 @@ proxy_on() {
 }
 
 proxy_off() {
-  unset DEV_PROXY_HOST DEV_PROXY_HOST_SOURCE
+  unset DEV_PROXY_HOST DEV_PROXY_HOST_SOURCE _dev_proxy_resolved_host
   unset HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY
   unset http_proxy https_proxy all_proxy no_proxy
 }
 
 proxy_refresh() {
-  unset DEV_PROXY_HOST DEV_PROXY_HOST_SOURCE
+  unset DEV_PROXY_HOST DEV_PROXY_HOST_SOURCE _dev_proxy_resolved_host
   proxy_on
 }
 
