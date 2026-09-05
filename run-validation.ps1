@@ -95,6 +95,20 @@ function Get-UnusedPort {
     }
 }
 
+function Get-ExpectedProxyOverride([string]$NoProxy) {
+    # Mirrors what the tool must produce from noProxy, so the check follows the
+    # configuration instead of pinning one literal bypass string.
+    $parts = @()
+    foreach ($item in ("$NoProxy" -split "[,;]")) {
+        $trimmed = $item.Trim()
+        if (!$trimmed) { continue }
+        if ($trimmed.StartsWith(".")) { $trimmed = "*$trimmed" }
+        if ($parts -notcontains $trimmed) { $parts += $trimmed }
+    }
+    if ($parts -notcontains "<local>") { $parts += "<local>" }
+    return ($parts -join ";")
+}
+
 function Get-WslConfigBackupCount {
     return @(Get-ChildItem "$env:USERPROFILE\.wslconfig.bak.*" -ErrorAction SilentlyContinue).Count
 }
@@ -186,9 +200,14 @@ if ((Get-Command git -ErrorAction SilentlyContinue) -and (Test-Path (Join-Path $
 
 Write-Section "2. Dry run"
 
+$configSource = if (Test-Path $ConfigPath) { $ConfigPath } else { $ExamplePath }
+$config = Get-Content $configSource -Raw | ConvertFrom-Json
+$expectedOverride = Get-ExpectedProxyOverride $config.noProxy
+
 $dry = Invoke-DevProxy @("-NonInteractive", "-DryRun")
 Add-Check "dry run completes" ($dry.ExitCode -eq 0) "exit $($dry.ExitCode)"
-Add-Check "bypass list derives from noProxy" ([bool]($dry.Text -match "\*\.local;<local>\)")) (($dry.Output | Where-Object { $_ -match "bypass:" }) -join "")
+Add-Check "bypass list derives from noProxy" ($dry.Text.Contains("(bypass: $expectedOverride)")) "expected $expectedOverride"
+
 $envWrites = @($dry.Output | Where-Object { $_ -match "would set user env" }).Count
 Add-Check "writes all 8 proxy env vars" ($envWrites -eq 8) "$envWrites of 8"
 
@@ -204,8 +223,7 @@ if (-not $Full) {
         $Distro = (Get-Content $ConfigPath -Raw | ConvertFrom-Json).distro
     }
 
-    $config = if (Test-Path $ConfigPath) { Get-Content $ConfigPath -Raw | ConvertFrom-Json } else { $null }
-    $expectMirrored = [bool]($config -and $config.enableWslMirrored)
+    $expectMirrored = [bool]$config.enableWslMirrored
 
     if (-not $Force) {
         Write-Host ""
@@ -227,11 +245,15 @@ if (-not $Full) {
         Write-Section "3. Apply and idempotence"
 
         $applyArgs = @("-NonInteractive", "-Distro", $Distro)
-        $configBefore = if (Test-Path $ConfigPath) { (Get-Item $ConfigPath).LastWriteTimeUtc } else { $null }
-        $backupsBefore = Get-WslConfigBackupCount
 
         $first = Invoke-DevProxy $applyArgs
         Add-Check "apply and verify" ($first.ExitCode -eq 0) "exit $($first.ExitCode)"
+
+        # Take the baseline after the first apply. That run may legitimately
+        # create .wslconfig or save a distro; idempotence is a property of the
+        # second run, not of the first.
+        $configBefore = if (Test-Path $ConfigPath) { (Get-Item $ConfigPath).LastWriteTimeUtc } else { $null }
+        $backupsBefore = Get-WslConfigBackupCount
 
         $second = Invoke-DevProxy $applyArgs
         Add-Check "second apply verifies too" ($second.ExitCode -eq 0) "exit $($second.ExitCode)"
@@ -249,7 +271,7 @@ if (-not $Full) {
 
         $reg = Get-ItemProperty $InternetSettingsPath
         Add-Check "system proxy enabled" ($reg.ProxyEnable -eq 1) "$($reg.ProxyServer)"
-        Add-Check "bypass list applied" ("$($reg.ProxyOverride)".EndsWith("<local>")) "$($reg.ProxyOverride)"
+        Add-Check "bypass list applied" ("$($reg.ProxyOverride)" -eq $expectedOverride) "$($reg.ProxyOverride)"
         $unset = @($ProxyEnvNames | Where-Object { [string]::IsNullOrEmpty([Environment]::GetEnvironmentVariable($_, "User")) })
         Add-Check "all proxy env names resolve" ($unset.Count -eq 0) $(if ($unset) { "unset: $($unset -join ', ')" } else { "" })
         $stored = @((Get-Item "HKCU:\Environment").Property | Where-Object { $_ -match "proxy" })

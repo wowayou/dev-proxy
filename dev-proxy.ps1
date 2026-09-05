@@ -25,8 +25,11 @@ $InternetSettingsPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Interne
 $ProxyEnvNames = @("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "all_proxy", "no_proxy")
 $DefaultProxyPort = 20122
 
-# Counted by Write-Fail so -Verify can return a script-friendly exit code.
+# VerifyFailures counts one verification run, for its summary line. HadFailures
+# is never reset, so a failure raised before verification still reaches the
+# exit code.
 $script:VerifyFailures = 0
+$script:HadFailures = $false
 
 try {
     # Windows PowerShell 5.1 still offers TLS 1.0 first, which the endpoints used
@@ -78,6 +81,7 @@ function Write-Ok($Message) { Write-Line "[ OK ] $Message" ([ConsoleColor]::Gree
 function Write-Warn($Message) { Write-Line "[WARN] $Message" ([ConsoleColor]::Yellow) }
 function Write-Fail($Message) {
     $script:VerifyFailures++
+    $script:HadFailures = $true
     Write-Line "[FAIL] $Message" ([ConsoleColor]::Red)
 }
 function Write-Tip($Message) { Write-Line "[TIP ] $Message" ([ConsoleColor]::DarkCyan) }
@@ -348,12 +352,13 @@ function Write-WslOutputLines($Parsed) {
     foreach ($line in $Parsed.Lines) { Write-Line $line }
 }
 
-function Write-WslCommandOutput($Output) {
-    Write-WslOutputLines (Split-WslOutput $Output)
-}
-
 function Get-WslCleanLines($Output) {
     return (Split-WslOutput $Output).Lines
+}
+
+function Get-WslFailureReason($Result) {
+    if ($Result.TimedOut) { return "the WSL command timed out" }
+    return "the WSL command exited with code $($Result.ExitCode)"
 }
 
 function Invoke-WslBash {
@@ -384,14 +389,19 @@ function Invoke-WslBash {
                 $result += "$item"
             }
         }
-        if ($exitCode -eq 124) {
-            $result += "WSL command timed out after ${TimeoutSec}s"
-        } elseif ($exitCode -ne 0) {
-            $result += "WSL command exited with code $exitCode"
+        return [pscustomobject]@{
+            ExitCode = $exitCode
+            TimedOut = ($exitCode -eq 124)
+            Failed = ($exitCode -ne 0)
+            Lines = @($result)
         }
-        return $result
     } catch {
-        return @($_.Exception.Message)
+        return [pscustomobject]@{
+            ExitCode = -1
+            TimedOut = $false
+            Failed = $true
+            Lines = @($_.Exception.Message)
+        }
     } finally {
         $ErrorActionPreference = $oldPreference
     }
@@ -568,8 +578,13 @@ fi
 printf 'installed:%s\n' "$HOME/.config/dev-proxy/proxy-env.sh"
 '@
     $installCmd = $installCmd.Replace("__CONTENT_BASE64__", $contentBase64)
-    $output = Invoke-WslBash -Distro $Config.distro -Command $installCmd
-    Write-WslCommandOutput $output
+    $result = Invoke-WslBash -Distro $Config.distro -Command $installCmd
+    $parsed = Split-WslOutput $result.Lines
+    Write-WslOutputLines $parsed
+    if ($result.Failed -or -not ($parsed.Lines -match "^installed:")) {
+        Write-Fail "Could not install the WSL proxy environment for $($Config.distro): $(Get-WslFailureReason $result)"
+        return
+    }
     Write-Ok "Installed WSL proxy environment for $($Config.distro)"
     Write-Tip "Open a new WSL shell, or run: source ~/.profile"
 }
@@ -597,7 +612,13 @@ awk '{ if ($0 == "source \"$HOME/.config/dev-proxy/proxy-env.sh\"") print "# dis
 mv "$tmp" "$HOME/.profile"
 printf 'disabled\n'
 '@
-    $parsed = Split-WslOutput (Invoke-WslBash -Distro $Config.distro -Command $cmd)
+    $result = Invoke-WslBash -Distro $Config.distro -Command $cmd
+    $parsed = Split-WslOutput $result.Lines
+    if ($result.Failed) {
+        Write-WslOutputLines $parsed
+        Write-Fail "Could not disable the WSL proxy source line for $($Config.distro): $(Get-WslFailureReason $result)"
+        return
+    }
     if ($parsed.Lines -contains "already-disabled") {
         Write-Ok "WSL proxy source line was already disabled for $($Config.distro)"
         return
@@ -703,28 +724,44 @@ trap 'rm -rf "$tmp"' EXIT
 check_url() {
   label="$1"
   url="$2"
-  curl -I --max-time 15 "$url" >"$tmp/head" 2>"$tmp/err" || true
-  if grep -qi '^HTTP/' "$tmp/head"; then
-    printf 'PASS_%s\n' "$label"
+  # %{http_code} is the final response status, not the proxy's CONNECT reply,
+  # and a zero exit code is what proves the tunnel and the TLS handshake
+  # completed. Matching on "HTTP/" alone would accept a 200 Connection
+  # established followed by a failed handshake.
+  status="$(curl -sS -o /dev/null -I --max-time 15 -w '%{http_code}' "$url" 2>"$tmp/err")"
+  rc=$?
+  if [ "$rc" -eq 0 ] && [ -n "$status" ] && [ "$status" != "000" ]; then
+    printf 'PASS_%s http=%s\n' "$label" "$status"
   else
-    printf 'FAIL_%s\n' "$label"
-    cat "$tmp/err"
+    printf 'FAIL_%s rc=%s http=%s\n' "$label" "$rc" "${status:-none}"
+    sed -n '1,3p' "$tmp/err"
   fi
 }
 
 check_url OPENAI https://api.openai.com/v1/models
 check_url ANTHROPIC https://api.anthropic.com
+# Sentinel: its absence means the script stopped early.
+printf 'CHECKS_DONE\n'
 '@
-        $output = Invoke-WslBash -Distro $Config.distro -Command $cmd
-        $parsed = Split-WslOutput $output
+        $result = Invoke-WslBash -Distro $Config.distro -Command $cmd
+        $parsed = Split-WslOutput $result.Lines
         Write-WslOutputLines $parsed
-        foreach ($line in $parsed.Lines) {
-            if ($line -match "^FAIL_(.+)$") {
-                Write-Fail "WSL could not reach $($Matches[1]) through the proxy"
-            } elseif ($line -eq "MISSING_WSL_ENV") {
-                Write-Fail "WSL proxy profile is not installed in $($Config.distro)"
-            } elseif ($line -eq "proxy_tcp=unreachable") {
-                Write-Fail "WSL has no TCP path to the proxy listener"
+        if ($result.Failed) {
+            Write-Fail "WSL checks did not run for $($Config.distro): $(Get-WslFailureReason $result)"
+        } else {
+            foreach ($line in $parsed.Lines) {
+                if ($line -match "^FAIL_([A-Z_]+)") {
+                    Write-Fail "WSL could not reach $($Matches[1]) through the proxy: $line"
+                } elseif ($line -eq "MISSING_WSL_ENV") {
+                    Write-Fail "WSL proxy profile is not installed in $($Config.distro)"
+                } elseif ($line -eq "proxy_tcp=unreachable") {
+                    Write-Fail "WSL has no TCP path to the proxy listener"
+                }
+            }
+            # Without the sentinel the script stopped partway, which must not
+            # read as a clean run just because no FAIL_ marker was printed.
+            if (-not ($parsed.Lines -contains "MISSING_WSL_ENV") -and -not ($parsed.Lines -contains "CHECKS_DONE")) {
+                Write-Fail "WSL connectivity checks did not complete for $($Config.distro)"
             }
         }
     } else {
@@ -744,8 +781,8 @@ function Show-CcSwitchSuggestions($Config) {
         Write-Warn "Select a WSL distro first."
         return
     }
-    $rawHomeOutput = Invoke-WslBash -Distro $Config.distro -Command 'printf "%s\n" "$HOME"'
-    $wslHome = (@(Get-WslCleanLines $rawHomeOutput) -join "").Trim()
+    $homeResult = Invoke-WslBash -Distro $Config.distro -Command 'printf "%s\n" "$HOME"'
+    $wslHome = if ($homeResult.Failed) { "" } else { (@(Get-WslCleanLines $homeResult.Lines) -join "").Trim() }
     # Root and custom accounts do not live under /home, so ask the distro instead of guessing.
     if (!$wslHome) { $wslHome = "/home/<wslUser>" }
     $uncHome = "\\wsl.localhost\$($Config.distro)" + ($wslHome -replace "/", "\")
@@ -901,7 +938,7 @@ if ($Disable) {
 
 if ($Verify) {
     Verify-All $config
-    exit ([int]($script:VerifyFailures -gt 0))
+    exit ([int]($script:HadFailures))
 }
 
 if ($NonInteractive) {
@@ -922,7 +959,7 @@ if ($NonInteractive) {
         exit
     }
     Verify-All $config
-    exit ([int]($script:VerifyFailures -gt 0))
+    exit ([int]($script:HadFailures))
 }
 
 Show-Menu $config

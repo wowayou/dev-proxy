@@ -135,10 +135,13 @@ Start the local proxy client first, then apply twice. Re-running must not
 accumulate side effects:
 
 ```powershell
+.\dev-proxy.ps1 -NonInteractive -Distro Ubuntu-24.04
+
+# Baseline after the first run: that one may legitimately create .wslconfig or
+# save a distro. Idempotence is a property of the second run.
 (Get-Item .\config.json).LastWriteTime
 Get-ChildItem "$env:USERPROFILE\.wslconfig*" | Select-Object Name, LastWriteTime
 
-.\dev-proxy.ps1 -NonInteractive -Distro Ubuntu-24.04
 .\dev-proxy.ps1 -NonInteractive -Distro Ubuntu-24.04
 
 (Get-Item .\config.json).LastWriteTime
