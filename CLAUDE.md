@@ -30,13 +30,12 @@ When it is `false`, non-interactive setup must still install the WSL shell proxy
 From `C:\Users\Public\ops-tools\dev-proxy`:
 
 ```powershell
-$tokens = $null
-$errors = $null
-[System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path .\dev-proxy.ps1), [ref]$tokens, [ref]$errors) | Out-Null
-if ($errors) { $errors; exit 1 }
-Get-Content .\config.example.json -Raw | ConvertFrom-Json | Out-Null
-.\dev-proxy.ps1 -NonInteractive -DryRun
+.\run-validation.ps1           # parse, JSON, BOM, template syntax, dry run
+.\run-validation.ps1 -Full     # also apply, verify, WSL helpers, rollback, restore
 ```
+
+`run-validation.ps1` exits non-zero when any check fails. See `AGENTS.md` for
+what each step asserts.
 
 From WSL:
 

@@ -36,6 +36,28 @@ Run the suite under Windows PowerShell 5.1 at least once. It is the version the
 TLS 1.2 fallback and the BOM-less config writer exist for, and PowerShell 7
 formats `config.json` differently.
 
+### Run It In One Pass
+
+`run-validation.ps1` performs every check below and prints one `PASS`, `FAIL`,
+`SKIP`, or `INFO` line each, with a summary and a non-zero exit code when
+anything failed:
+
+```powershell
+.\run-validation.ps1           # steps 1 and 2 only, changes nothing
+.\run-validation.ps1 -Full     # adds steps 3 to 7, then restores a working setup
+```
+
+`-Full` prompts once before it touches real state; `-Force` skips that prompt and
+`-SkipRollback` leaves the rollback cycle out. It reads the WSL distro from
+`config.json` unless `-Distro` is given.
+
+The script invokes `dev-proxy.ps1` as a child process on purpose: `Write-Line`
+prints through `[Console]::Write`, which bypasses the PowerShell output stream,
+so output cannot be captured by assignment or `Tee-Object` in the same process.
+
+The steps below describe what each check asserts, and are the reference when a
+check fails or when a new one needs writing.
+
 ### 1. Parse And Syntax Checks
 
 Both scripts must parse:
