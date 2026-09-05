@@ -32,7 +32,7 @@ Open PowerShell in `C:\Users\Public\ops-tools\dev-proxy`:
 Recommended flow:
 
 1. Start your local proxy client with an HTTP or mixed listener on `127.0.0.1:20122`.
-2. Choose `1. Configure proxy target` if your local proxy uses another host, port, or scheme.
+2. Choose `1. Configure proxy target and preferences` if your local proxy uses another host, port, or scheme, or if you want a different bypass list or WSL mirrored preference.
 3. Choose `2. Set Windows system proxy + user env`.
 4. Choose `3. Select WSL distro`.
 5. Choose `4. Configure WSL mirrored mode + install WSL env`.
@@ -50,6 +50,13 @@ Verification only:
 
 ```powershell
 .\verify-dev-proxy.ps1
+```
+
+Verification exits `0` when every check passes and `1` when any check fails, so it can gate a script:
+
+```powershell
+.\verify-dev-proxy.ps1
+if ($LASTEXITCODE -ne 0) { "proxy is not healthy" }
 ```
 
 Rollback:
@@ -73,7 +80,7 @@ Rollback:
 }
 ```
 
-`enableWslMirrored` is a visible user preference. The menu header shows it, option 4 uses it as the default answer, and option 4 saves the answer back to `config.json`. In `-NonInteractive` mode, `.wslconfig` mirrored settings are applied only when this value is `true`; the WSL shell proxy environment is still installed either way.
+`enableWslMirrored` is a visible user preference. The menu header shows it, options 1 and 4 both let you change it, and both save the answer back to `config.json`. `noProxy` feeds the CLI bypass variables and the Windows system-proxy bypass list; entries that start with a dot, such as `.local`, are rewritten to the `*.local` form WinINet expects. Values are validated on load, so an out-of-range port or an unknown scheme falls back to the default with a warning instead of being written to the registry. In `-NonInteractive` mode, `.wslconfig` mirrored settings are applied only when this value is `true`; the WSL shell proxy environment is still installed either way.
 
 ## Windows Behavior
 
@@ -98,6 +105,8 @@ Option 4 installs a shell profile for the selected distro. New WSL shells source
 - `proxy_refresh`
 - `proxy_off`
 
+`proxy_status` reports `DEV_PROXY_HOST_SOURCE` as `mirrored-localhost`, `nat-gateway`, or `override`, which is usually the fastest way to tell which networking mode is actually in effect.
+
 The WSL profile dynamically resolves the Windows proxy host:
 
 - Mirrored networking: WSL can use the Windows proxy at `127.0.0.1:20122`.
@@ -112,10 +121,13 @@ Use option 5 or `.\verify-dev-proxy.ps1`.
 Healthy WSL output usually includes:
 
 ```text
+DEV_PROXY_HOST_SOURCE=mirrored-localhost
 proxy_tcp=reachable
 PASS_OPENAI
 PASS_ANTHROPIC
 ```
+
+The run ends with a summary line and, for `-Verify`, a matching exit code.
 
 HTTP `401`, `403`, or `404` from API endpoints is acceptable during these checks. It means the request reached the provider without credentials. A network timeout, connection refused, or missing `HTTP/` response is the problem to investigate.
 
@@ -127,7 +139,7 @@ WSL startup may warn about invalid Windows PATH entries, such as `UtilTranslateP
 
 If mirrored networking is disabled or unavailable, confirm these points:
 
-- `proxy_status` shows a vEthernet gateway host, not `<unresolved>`.
+- `proxy_status` shows `DEV_PROXY_HOST_SOURCE=nat-gateway` and a real host, not `<unresolved>`.
 - `proxy_tcp=reachable` is present.
 - Your Windows proxy client is listening beyond `127.0.0.1`.
 - Windows Firewall allows the proxy listener for the relevant network profile.

@@ -56,6 +56,13 @@ Dry-run with the saved mirrored preference:
 .\dev-proxy.ps1 -NonInteractive -DryRun
 ```
 
+Verification exit code check. `0` means every check passed, `1` means at least one failed:
+
+```powershell
+.\verify-dev-proxy.ps1
+$LASTEXITCODE
+```
+
 Dry-run with mirrored disabled, then restore the original value:
 
 ```powershell
@@ -70,9 +77,9 @@ $config | ConvertTo-Json -Depth 4 | Set-Content .\config.json -Encoding UTF8
 
 Interactive smoke checks:
 
-- Option 1 saves the proxy target.
+- Option 1 saves the proxy target, the bypass list, and `enableWslMirrored`, and rejects an out-of-range port or an unknown scheme.
 - Option 4 explains mirrored networking and NAT fallback, then persists `enableWslMirrored`.
-- Option 5 reports Windows and WSL verification without raw localized `netsh` noise.
+- Option 5 reports Windows and WSL verification without raw localized `netsh` noise, and ends with a failure-count summary.
 - Option 6 prints CC Switch paths only; it does not edit CC Switch.
 
 ## Static Checks

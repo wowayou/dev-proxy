@@ -20,6 +20,22 @@ $ScriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ConfigPath = Join-Path $ScriptRoot "config.json"
 $TemplatePath = Join-Path $ScriptRoot "templates\wsl-proxy-env.sh"
 
+# The Windows user-scope knobs this tool owns. Nothing outside these is touched.
+$InternetSettingsPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+$ProxyEnvNames = @("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "all_proxy", "no_proxy")
+$DefaultProxyPort = 20122
+
+# Counted by Write-Fail so -Verify can return a script-friendly exit code.
+$script:VerifyFailures = 0
+
+try {
+    # Windows PowerShell 5.1 still offers TLS 1.0 first, which the endpoints used
+    # for verification refuse outright. Add TLS 1.2 without dropping newer values.
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+} catch {
+    # Some constrained hosts forbid changing this. Verification still runs.
+}
+
 try {
     [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
     $OutputEncoding = [Console]::OutputEncoding
@@ -60,7 +76,10 @@ function Write-Line {
 function Write-Info($Message) { Write-Line "[INFO] $Message" ([ConsoleColor]::Cyan) }
 function Write-Ok($Message) { Write-Line "[ OK ] $Message" ([ConsoleColor]::Green) }
 function Write-Warn($Message) { Write-Line "[WARN] $Message" ([ConsoleColor]::Yellow) }
-function Write-Fail($Message) { Write-Line "[FAIL] $Message" ([ConsoleColor]::Red) }
+function Write-Fail($Message) {
+    $script:VerifyFailures++
+    Write-Line "[FAIL] $Message" ([ConsoleColor]::Red)
+}
 function Write-Tip($Message) { Write-Line "[TIP ] $Message" ([ConsoleColor]::DarkCyan) }
 function Show-Progress($Activity, $Status, [int]$Percent) {
     Write-Info ("{0} [{1,3}%] {2}" -f $Activity, $Percent, $Status)
@@ -72,8 +91,11 @@ function Complete-Progress($Activity) {
 function Read-YesNo($Prompt, [bool]$Default = $true) {
     $suffix = if ($Default) { "Y/n" } else { "y/N" }
     $answer = Read-Host "$Prompt [$suffix]"
-    if ([string]::IsNullOrWhiteSpace($answer)) { return $Default }
-    return $answer.Trim().ToLowerInvariant().StartsWith("y")
+    $answer = "$answer".Trim().ToLowerInvariant()
+    if ($answer -in @("y", "yes")) { return $true }
+    if ($answer -in @("n", "no")) { return $false }
+    # Blank or unrecognized input keeps the shown default rather than silently meaning "no".
+    return $Default
 }
 
 function Get-DefaultConfig {
@@ -101,24 +123,75 @@ function Read-Config {
             Write-Warn "config.json could not be parsed; using defaults. $($_.Exception.Message)"
         }
     }
-    if ($ProxyHost) { $defaults.proxyHost = $ProxyHost }
+    if ($ProxyHost) { $defaults.proxyHost = $ProxyHost.Trim() }
     if ($ProxyPort -gt 0) { $defaults.proxyPort = $ProxyPort }
     if ($ProxyScheme) { $defaults.proxyScheme = $ProxyScheme }
-    if ($Distro) { $defaults.distro = $Distro }
+    if ($Distro) { $defaults.distro = $Distro.Trim() }
+
+    # config.json is hand-editable, so normalize before anything writes it into
+    # the registry, the WSL template, or an env var.
+    $port = 0
+    if (![int]::TryParse("$($defaults.proxyPort)", [ref]$port) -or !(Test-ProxyPort $port)) {
+        Write-Warn "Proxy port '$($defaults.proxyPort)' is not in 1-65535; using $DefaultProxyPort."
+        $port = $DefaultProxyPort
+    }
+    $defaults.proxyPort = $port
+    if ("$($defaults.proxyScheme)" -notin @("http", "https")) {
+        Write-Warn "Proxy scheme '$($defaults.proxyScheme)' is not http or https; using http."
+        $defaults.proxyScheme = "http"
+    }
+    if ([string]::IsNullOrWhiteSpace("$($defaults.proxyHost)")) { $defaults.proxyHost = "127.0.0.1" }
+    $defaults.enableWslMirrored = [bool]$defaults.enableWslMirrored
     return $defaults
 }
 
 function Save-Config($Config) {
+    $json = ($Config | ConvertTo-Json -Depth 4)
     if ($DryRun) {
         Write-Info "Dry-run: would save $ConfigPath"
         return
     }
-    if (!(Test-Path $ScriptRoot)) { New-Item -ItemType Directory -Path $ScriptRoot -Force | Out-Null }
-    $Config | ConvertTo-Json -Depth 4 | Set-Content -Path $ConfigPath -Encoding UTF8
+    if (Test-Path $ConfigPath) {
+        try {
+            if ((Get-Content $ConfigPath -Raw).Trim() -eq $json.Trim()) { return }
+        } catch {
+            # Unreadable file just means we rewrite it below.
+        }
+    }
+    # BOM-less UTF-8 so non-PowerShell readers of config.json do not trip on a BOM.
+    [IO.File]::WriteAllText($ConfigPath, $json + [Environment]::NewLine, (New-Object Text.UTF8Encoding($false)))
+}
+
+function Test-ProxyPort([int]$Port) {
+    return ($Port -ge 1 -and $Port -le 65535)
 }
 
 function Get-ProxyUrl($Config) {
     "$($Config.proxyScheme)://$($Config.proxyHost):$($Config.proxyPort)"
+}
+
+function ConvertTo-ProxyOverride([string]$NoProxy) {
+    # WinINet wants semicolons and its own <local> token, config.json uses the
+    # comma-separated form the CLI env vars expect. Keep one source of truth.
+    $parts = @()
+    foreach ($item in ("$NoProxy" -split "[,;]")) {
+        $trimmed = $item.Trim()
+        if (!$trimmed) { continue }
+        # curl-style ".local" means "any host in that suffix"; WinINet needs "*.local".
+        if ($trimmed.StartsWith(".")) { $trimmed = "*$trimmed" }
+        if ($parts -notcontains $trimmed) { $parts += $trimmed }
+    }
+    if ($parts -notcontains "<local>") { $parts += "<local>" }
+    return ($parts -join ";")
+}
+
+function Get-ProxyEnvMap($Config) {
+    $proxy = Get-ProxyUrl $Config
+    $map = [ordered]@{}
+    foreach ($name in $ProxyEnvNames) {
+        $map[$name] = if ($name -ieq "NO_PROXY") { [string]$Config.noProxy } else { $proxy }
+    }
+    return $map
 }
 
 function Test-IsAdmin {
@@ -148,57 +221,44 @@ public static class DevProxyWinInet {
 }
 
 function Set-WindowsSystemProxy($Config) {
-    $path = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings"
     $server = "$($Config.proxyHost):$($Config.proxyPort)"
-    $override = "localhost;127.0.0.1;::1;<local>"
+    $override = ConvertTo-ProxyOverride $Config.noProxy
 
     if ($DryRun) {
-        Write-Info "Dry-run: would set Windows system proxy to $server"
+        Write-Info "Dry-run: would set Windows system proxy to $server (bypass: $override)"
         return
     }
 
-    Set-ItemProperty -Path $path -Name ProxyEnable -Type DWord -Value 1
-    Set-ItemProperty -Path $path -Name ProxyServer -Type String -Value $server
-    Set-ItemProperty -Path $path -Name ProxyOverride -Type String -Value $override
+    Set-ItemProperty -Path $InternetSettingsPath -Name ProxyEnable -Type DWord -Value 1
+    Set-ItemProperty -Path $InternetSettingsPath -Name ProxyServer -Type String -Value $server
+    Set-ItemProperty -Path $InternetSettingsPath -Name ProxyOverride -Type String -Value $override
     Invoke-WinInetRefresh
     Write-Ok "Windows user system proxy set to $server"
 }
 
 function Clear-WindowsSystemProxy {
-    $path = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings"
     if ($DryRun) {
         Write-Info "Dry-run: would disable Windows user system proxy"
         return
     }
-    Set-ItemProperty -Path $path -Name ProxyEnable -Type DWord -Value 0
+    Set-ItemProperty -Path $InternetSettingsPath -Name ProxyEnable -Type DWord -Value 0
     Invoke-WinInetRefresh
     Write-Ok "Windows user system proxy disabled"
 }
 
 function Set-UserProxyEnv($Config) {
-    $proxy = Get-ProxyUrl $Config
-    $vars = @(
-        @{ Name = "HTTP_PROXY"; Value = $proxy },
-        @{ Name = "HTTPS_PROXY"; Value = $proxy },
-        @{ Name = "ALL_PROXY"; Value = $proxy },
-        @{ Name = "NO_PROXY"; Value = $Config.noProxy },
-        @{ Name = "http_proxy"; Value = $proxy },
-        @{ Name = "https_proxy"; Value = $proxy },
-        @{ Name = "all_proxy"; Value = $proxy },
-        @{ Name = "no_proxy"; Value = $Config.noProxy }
-    )
-    foreach ($entry in $vars) {
+    foreach ($entry in (Get-ProxyEnvMap $Config).GetEnumerator()) {
         if ($DryRun) {
-            Write-Info "Dry-run: would set user env $($entry.Name)=$($entry.Value)"
+            Write-Info "Dry-run: would set user env $($entry.Key)=$($entry.Value)"
         } else {
-            [Environment]::SetEnvironmentVariable($entry.Name, [string]$entry.Value, "User")
+            [Environment]::SetEnvironmentVariable($entry.Key, [string]$entry.Value, "User")
         }
     }
     if (!$DryRun) { Write-Ok "Windows user proxy environment variables updated" }
 }
 
 function Clear-UserProxyEnv {
-    foreach ($name in @("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "all_proxy", "no_proxy")) {
+    foreach ($name in $ProxyEnvNames) {
         if ($DryRun) {
             Write-Info "Dry-run: would clear user env $name"
         } else {
@@ -208,40 +268,39 @@ function Clear-UserProxyEnv {
     if (!$DryRun) { Write-Ok "Windows user proxy environment variables cleared" }
 }
 
-function Sync-WinHttpProxy {
+function Invoke-NetshWinHttp {
+    param(
+        [Parameter(Mandatory = $true)][string[]]$Arguments,
+        [Parameter(Mandatory = $true)][string]$Progress,
+        [Parameter(Mandatory = $true)][string]$Success
+    )
+
+    # Never elevates on its own; it only tells the user the command to run.
+    $command = "netsh " + ($Arguments -join " ")
     if (!(Test-IsAdmin)) {
-        Write-Warn "WinHTTP sync requires an elevated PowerShell. Run: netsh winhttp import proxy source=ie"
+        Write-Warn "This step requires an elevated PowerShell. Run: $command"
         return
     }
     if ($DryRun) {
-        Write-Info "Dry-run: would run netsh winhttp import proxy source=ie"
+        Write-Info "Dry-run: would run $command"
         return
     }
-    Write-Info "Syncing WinHTTP from Windows user system proxy. This can take a few seconds..."
-    & netsh.exe winhttp import proxy source=ie *> $null
+    Write-Info $Progress
+    # Raw localized netsh output is suppressed to avoid mojibake in mixed-encoding terminals.
+    & netsh.exe @Arguments *> $null
     if ($LASTEXITCODE -eq 0) {
-        Write-Ok "WinHTTP proxy imported from Windows user system proxy"
+        Write-Ok $Success
     } else {
-        Write-Warn "WinHTTP proxy import returned exit code $LASTEXITCODE"
+        Write-Warn "'$command' returned exit code $LASTEXITCODE"
     }
 }
 
+function Sync-WinHttpProxy {
+    Invoke-NetshWinHttp -Arguments @("winhttp", "import", "proxy", "source=ie") -Progress "Syncing WinHTTP from Windows user system proxy. This can take a few seconds..." -Success "WinHTTP proxy imported from Windows user system proxy"
+}
+
 function Reset-WinHttpProxy {
-    if (!(Test-IsAdmin)) {
-        Write-Warn "WinHTTP reset requires an elevated PowerShell. Run: netsh winhttp reset proxy"
-        return
-    }
-    if ($DryRun) {
-        Write-Info "Dry-run: would run netsh winhttp reset proxy"
-        return
-    }
-    Write-Info "Resetting WinHTTP proxy..."
-    & netsh.exe winhttp reset proxy *> $null
-    if ($LASTEXITCODE -eq 0) {
-        Write-Ok "WinHTTP proxy reset"
-    } else {
-        Write-Warn "WinHTTP proxy reset returned exit code $LASTEXITCODE"
-    }
+    Invoke-NetshWinHttp -Arguments @("winhttp", "reset", "proxy") -Progress "Resetting WinHTTP proxy..." -Success "WinHTTP proxy reset"
 }
 
 function Show-WinHttpProxy {
@@ -255,43 +314,42 @@ function Test-WslLocalhostProxyNoise([string]$Text) {
     return $false
 }
 
-function Write-WslCommandOutput($Output) {
-    $warnedPath = $false
-    $warnedLocalhost = $false
+function Split-WslOutput($Output) {
+    # Separates real output from the two startup noise categories WSL emits, so
+    # callers can print, count, or parse the same filtered lines.
+    $lines = New-Object System.Collections.Generic.List[string]
+    $sawPathNoise = $false
+    $sawLocalhostNoise = $false
     foreach ($item in $Output) {
         $text = ("$item" -replace "`0", "").TrimEnd()
         if ([string]::IsNullOrWhiteSpace($text)) { continue }
-
-        if ($text -match "UtilTranslatePathList|Failed to translate") {
-            if (!$warnedPath) {
-                Write-Warn "WSL skipped invalid Windows PATH entries while starting. This is harmless for this tool; clean Windows PATH later if desired."
-                $warnedPath = $true
-            }
-            continue
-        }
-
-        if (Test-WslLocalhostProxyNoise $text) {
-            if (!$warnedLocalhost) {
-                Write-Warn "WSL reports localhost proxy is not mirrored. In NAT mode, enable mirrored networking or make your proxy client listen on LAN/0.0.0.0."
-                $warnedLocalhost = $true
-            }
-            continue
-        }
-
-        Write-Line $text
+        if ($text -match "UtilTranslatePathList|Failed to translate") { $sawPathNoise = $true; continue }
+        if (Test-WslLocalhostProxyNoise $text) { $sawLocalhostNoise = $true; continue }
+        $lines.Add($text)
+    }
+    return [pscustomobject]@{
+        Lines = $lines.ToArray()
+        SawPathNoise = $sawPathNoise
+        SawLocalhostNoise = $sawLocalhostNoise
     }
 }
 
-function Get-WslCleanLines($Output) {
-    $lines = @()
-    foreach ($item in $Output) {
-        $text = ("$item" -replace "`0", "").TrimEnd()
-        if ([string]::IsNullOrWhiteSpace($text)) { continue }
-        if ($text -match "UtilTranslatePathList|Failed to translate") { continue }
-        if (Test-WslLocalhostProxyNoise $text) { continue }
-        $lines += $text
+function Write-WslOutputLines($Parsed) {
+    if ($Parsed.SawPathNoise) {
+        Write-Warn "WSL skipped invalid Windows PATH entries while starting. This is harmless for this tool; clean Windows PATH later if desired."
     }
-    return $lines
+    if ($Parsed.SawLocalhostNoise) {
+        Write-Warn "WSL reports localhost proxy is not mirrored. In NAT mode, enable mirrored networking or make your proxy client listen on LAN/0.0.0.0."
+    }
+    foreach ($line in $Parsed.Lines) { Write-Line $line }
+}
+
+function Write-WslCommandOutput($Output) {
+    Write-WslOutputLines (Split-WslOutput $Output)
+}
+
+function Get-WslCleanLines($Output) {
+    return (Split-WslOutput $Output).Lines
 }
 
 function Invoke-WslBash {
@@ -421,13 +479,20 @@ function Set-IniValue([string[]]$Lines, [string]$Section, [string]$Key, [string]
 
 function Configure-WslMirrored {
     $path = Join-Path $env:USERPROFILE ".wslconfig"
-    $lines = @()
+    $existing = @()
     if (Test-Path $path) {
-        $lines = Get-Content $path
+        $existing = @(Get-Content $path)
     }
+    $lines = $existing
     $lines = Set-IniValue $lines "wsl2" "networkingMode" "mirrored"
     $lines = Set-IniValue $lines "wsl2" "dnsTunneling" "true"
     $lines = Set-IniValue $lines "wsl2" "autoProxy" "true"
+
+    if (($existing -join "`n") -eq (@($lines) -join "`n")) {
+        # Repeat runs otherwise leave a new .bak file behind every time.
+        Write-Ok "$path already has mirrored networking settings"
+        return
+    }
 
     if ($DryRun) {
         Write-Info "Dry-run: would update $path with mirrored networking"
@@ -513,15 +578,18 @@ fi
 }
 
 function Test-TcpPort([string]$HostName, [int]$Port, [int]$TimeoutMs = 700) {
+    $client = $null
     try {
         $client = New-Object System.Net.Sockets.TcpClient
         $iar = $client.BeginConnect($HostName, $Port, $null, $null)
         $ok = $iar.AsyncWaitHandle.WaitOne($TimeoutMs, $false)
         if ($ok) { $client.EndConnect($iar) }
-        $client.Close()
         return $ok
     } catch {
         return $false
+    } finally {
+        # EndConnect can throw on a refused port; without this the socket leaks.
+        if ($null -ne $client) { $client.Close() }
     }
 }
 
@@ -543,15 +611,15 @@ function Test-UrlViaProxy([string]$Url, [string]$ProxyUrl) {
 }
 
 function Verify-All($Config) {
+    $script:VerifyFailures = 0
     $proxyUrl = Get-ProxyUrl $Config
     Write-Line
     Write-Info "Verifying dev proxy configuration ($proxyUrl)"
     $activity = "Verifying dev proxy"
     Show-Progress $activity "Checking Windows system proxy" 10
 
-    $internetPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings"
     try {
-        $reg = Get-ItemProperty $internetPath
+        $reg = Get-ItemProperty $InternetSettingsPath
         if ($reg.ProxyEnable -eq 1 -and "$($reg.ProxyServer)" -eq "$($Config.proxyHost):$($Config.proxyPort)") {
             Write-Ok "Windows user system proxy is enabled: $($reg.ProxyServer)"
         } else {
@@ -589,25 +657,57 @@ function Verify-All($Config) {
         Show-Progress $activity "Testing WSL proxy environment and connectivity" 82
         Write-Info "Verifying WSL distro: $($Config.distro)"
         $cmd = @'
-set -e
-if [ -f "$HOME/.config/dev-proxy/proxy-env.sh" ]; then
-  . "$HOME/.config/dev-proxy/proxy-env.sh"
-  proxy_status || true
-  curl -I --max-time 15 https://api.openai.com/v1/models >/tmp/dev-proxy-openai.headers 2>/tmp/dev-proxy-openai.err || true
-  if grep -qi '^HTTP/' /tmp/dev-proxy-openai.headers; then echo PASS_OPENAI; else echo FAIL_OPENAI; cat /tmp/dev-proxy-openai.err; fi
-  curl -I --max-time 15 https://api.anthropic.com >/tmp/dev-proxy-anthropic.headers 2>/tmp/dev-proxy-anthropic.err || true
-  if grep -qi '^HTTP/' /tmp/dev-proxy-anthropic.headers; then echo PASS_ANTHROPIC; else echo FAIL_ANTHROPIC; cat /tmp/dev-proxy-anthropic.err; fi
-else
-  echo MISSING_WSL_ENV
+env_file="$HOME/.config/dev-proxy/proxy-env.sh"
+if [ ! -f "$env_file" ]; then
+  printf 'MISSING_WSL_ENV\n'
+  exit 0
 fi
+
+# proxy_on returns non-zero when no host resolves. Keep going either way so
+# proxy_status can report what actually happened.
+. "$env_file" || true
+proxy_status || true
+
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+
+check_url() {
+  label="$1"
+  url="$2"
+  curl -I --max-time 15 "$url" >"$tmp/head" 2>"$tmp/err" || true
+  if grep -qi '^HTTP/' "$tmp/head"; then
+    printf 'PASS_%s\n' "$label"
+  else
+    printf 'FAIL_%s\n' "$label"
+    cat "$tmp/err"
+  fi
+}
+
+check_url OPENAI https://api.openai.com/v1/models
+check_url ANTHROPIC https://api.anthropic.com
 '@
         $output = Invoke-WslBash -Distro $Config.distro -Command $cmd
-        Write-WslCommandOutput $output
+        $parsed = Split-WslOutput $output
+        Write-WslOutputLines $parsed
+        foreach ($line in $parsed.Lines) {
+            if ($line -match "^FAIL_(.+)$") {
+                Write-Fail "WSL could not reach $($Matches[1]) through the proxy"
+            } elseif ($line -eq "MISSING_WSL_ENV") {
+                Write-Fail "WSL proxy profile is not installed in $($Config.distro)"
+            } elseif ($line -eq "proxy_tcp=unreachable") {
+                Write-Fail "WSL has no TCP path to the proxy listener"
+            }
+        }
     } else {
         Write-Warn "No WSL distro selected; skipping WSL checks."
     }
     Complete-Progress $activity
     Write-Tip "HTTP 401/403/404 from API endpoints is acceptable here; it means network connectivity worked without credentials."
+    if ($script:VerifyFailures -eq 0) {
+        Write-Ok "Verification finished with no failures"
+    } else {
+        Write-Line ("[FAIL] Verification finished with {0} failure(s)" -f $script:VerifyFailures) ([ConsoleColor]::Red)
+    }
 }
 
 function Show-CcSwitchSuggestions($Config) {
@@ -615,30 +715,52 @@ function Show-CcSwitchSuggestions($Config) {
         Write-Warn "Select a WSL distro first."
         return
     }
-    $rawUserOutput = Invoke-WslBash -Distro $Config.distro -Command 'id -un'
-    $cleanUserOutput = @(Get-WslCleanLines $rawUserOutput)
-    $wslUser = ($cleanUserOutput -join "").Trim()
-    if (!$wslUser) { $wslUser = "<wslUser>" }
+    $rawHomeOutput = Invoke-WslBash -Distro $Config.distro -Command 'printf "%s\n" "$HOME"'
+    $wslHome = (@(Get-WslCleanLines $rawHomeOutput) -join "").Trim()
+    # Root and custom accounts do not live under /home, so ask the distro instead of guessing.
+    if (!$wslHome) { $wslHome = "/home/<wslUser>" }
+    $uncHome = "\\wsl.localhost\$($Config.distro)" + ($wslHome -replace "/", "\")
     Write-Line
     Write-Info "CC Switch suggested values"
     Write-Line "Global proxy: $(Get-ProxyUrl $Config)"
-    Write-Line "Claude directory: \\wsl.localhost\$($Config.distro)\home\$wslUser\.claude"
-    Write-Line "Codex directory:  \\wsl.localhost\$($Config.distro)\home\$wslUser\.codex"
+    Write-Line "Claude directory: $uncHome\.claude"
+    Write-Line "Codex directory:  $uncHome\.codex"
     Write-Line
     Write-Warn "Do not put these paths in CC Switch's app config directory field."
 }
 
 function Configure-Settings($Config) {
     Write-Line
+    Write-Tip "Press Enter to keep the value shown in brackets."
     $portAnswer = Read-Host "Proxy port [$($Config.proxyPort)]"
-    if ($portAnswer -as [int]) { $Config.proxyPort = [int]$portAnswer }
+    if (![string]::IsNullOrWhiteSpace($portAnswer)) {
+        $port = 0
+        if ([int]::TryParse($portAnswer.Trim(), [ref]$port) -and (Test-ProxyPort $port)) {
+            $Config.proxyPort = $port
+        } else {
+            Write-Warn "Ignoring '$portAnswer'; the port must be a number in 1-65535."
+        }
+    }
     $hostAnswer = Read-Host "Proxy host [$($Config.proxyHost)]"
     if (![string]::IsNullOrWhiteSpace($hostAnswer)) { $Config.proxyHost = $hostAnswer.Trim() }
     $schemeAnswer = Read-Host "Proxy scheme http/https [$($Config.proxyScheme)]"
-    if ($schemeAnswer -in @("http", "https")) { $Config.proxyScheme = $schemeAnswer }
+    if (![string]::IsNullOrWhiteSpace($schemeAnswer)) {
+        $scheme = $schemeAnswer.Trim().ToLowerInvariant()
+        if ($scheme -in @("http", "https")) {
+            $Config.proxyScheme = $scheme
+        } else {
+            Write-Warn "Ignoring '$schemeAnswer'; the scheme must be http or https."
+        }
+    }
+    $noProxyAnswer = Read-Host "Bypass list, comma separated [$($Config.noProxy)]"
+    if (![string]::IsNullOrWhiteSpace($noProxyAnswer)) { $Config.noProxy = $noProxyAnswer.Trim() }
+    $Config.enableWslMirrored = Read-YesNo "Prefer WSL mirrored networking?" ([bool]$Config.enableWslMirrored)
     Save-Config $Config
     Write-Ok "Saved proxy target: $(Get-ProxyUrl $Config)"
+    Write-Ok "Bypass list: $($Config.noProxy)"
+    Write-Ok "WSL mirrored preference: $(if ($Config.enableWslMirrored) { 'enabled' } else { 'disabled' })"
     Write-Tip "Make sure your local proxy client exposes an HTTP or mixed listener on this address."
+    Write-Tip "Re-run option 2 and option 4 to apply the new values."
 }
 
 function Apply-WindowsProxy($Config) {
@@ -710,7 +832,7 @@ function Show-Menu($Config) {
         Write-Line "Scope: Windows user proxy/env + selected WSL shell env" ([ConsoleColor]::DarkGray)
         Write-Line "Safe:  CC Switch/provider files are not edited" ([ConsoleColor]::DarkGray)
         Write-Line
-        Write-Line "1. Configure proxy target"
+        Write-Line "1. Configure proxy target and preferences"
         Write-Line "2. Set Windows system proxy + user env"
         Write-Line "3. Select WSL distro"
         Write-Line "4. Configure WSL mirrored mode + install WSL env"
@@ -748,7 +870,7 @@ if ($Disable) {
 
 if ($Verify) {
     Verify-All $config
-    exit
+    exit ([int]($script:VerifyFailures -gt 0))
 }
 
 if ($NonInteractive) {
@@ -769,7 +891,7 @@ if ($NonInteractive) {
         exit
     }
     Verify-All $config
-    exit
+    exit ([int]($script:VerifyFailures -gt 0))
 }
 
 Show-Menu $config

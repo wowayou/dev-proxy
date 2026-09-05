@@ -19,23 +19,32 @@ _dev_proxy_windows_host() {
   # Mirrored networking can use Windows localhost. NAT mode must use the WSL
   # default gateway, which is the Windows vEthernet address and may change.
   if _dev_proxy_can_connect "127.0.0.1" "${DEV_PROXY_PORT}"; then
+    DEV_PROXY_HOST_SOURCE="mirrored-localhost"
     printf '%s\n' "127.0.0.1"
     return 0
   fi
 
+  DEV_PROXY_HOST_SOURCE="nat-gateway"
   ip route show default 2>/dev/null | awk 'NR==1 {print $3}'
 }
 
 proxy_on() {
   local host
   # Set DEV_PROXY_HOST_OVERRIDE only when you intentionally want a fixed host.
-  host="${DEV_PROXY_HOST_OVERRIDE:-$(_dev_proxy_windows_host)}"
+  if [ -n "${DEV_PROXY_HOST_OVERRIDE:-}" ]; then
+    host="${DEV_PROXY_HOST_OVERRIDE}"
+    DEV_PROXY_HOST_SOURCE="override"
+  else
+    DEV_PROXY_HOST_SOURCE="unresolved"
+    host="$(_dev_proxy_windows_host)"
+  fi
   if [ -z "${host}" ]; then
     printf 'dev-proxy: unable to resolve Windows proxy host\n' >&2
     return 1
   fi
 
   export DEV_PROXY_HOST="${host}"
+  export DEV_PROXY_HOST_SOURCE
   export HTTP_PROXY="${DEV_PROXY_SCHEME}://${DEV_PROXY_HOST}:${DEV_PROXY_PORT}"
   export HTTPS_PROXY="${HTTP_PROXY}"
   export ALL_PROXY="${HTTP_PROXY}"
@@ -48,23 +57,26 @@ proxy_on() {
 }
 
 proxy_off() {
-  unset DEV_PROXY_HOST
+  unset DEV_PROXY_HOST DEV_PROXY_HOST_SOURCE
   unset HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY
   unset http_proxy https_proxy all_proxy no_proxy
 }
 
 proxy_refresh() {
-  unset DEV_PROXY_HOST
+  unset DEV_PROXY_HOST DEV_PROXY_HOST_SOURCE
   proxy_on
 }
 
 proxy_status() {
   printf 'DEV_PROXY_HOST=%s\n' "${DEV_PROXY_HOST:-<unresolved>}"
+  # Naming the source makes mirrored-vs-NAT problems obvious at a glance.
+  printf 'DEV_PROXY_HOST_SOURCE=%s\n' "${DEV_PROXY_HOST_SOURCE:-<unresolved>}"
   if [ -n "${DEV_PROXY_HOST_OVERRIDE:-}" ]; then
     printf 'DEV_PROXY_HOST_OVERRIDE=%s\n' "${DEV_PROXY_HOST_OVERRIDE}"
   fi
   printf 'DEV_PROXY_PORT=%s\n' "${DEV_PROXY_PORT}"
   printf 'HTTP_PROXY=%s\n' "${HTTP_PROXY:-<unset>}"
+  printf 'NO_PROXY=%s\n' "${NO_PROXY:-<unset>}"
   if _dev_proxy_can_connect "${DEV_PROXY_HOST:-127.0.0.1}" "${DEV_PROXY_PORT}"; then
     printf 'proxy_tcp=reachable\n'
   else
@@ -72,4 +84,6 @@ proxy_status() {
   fi
 }
 
-proxy_on
+# Sourced from ~/.profile: a failed lookup must not leave the login shell with a
+# non-zero status. proxy_on already explains the failure on stderr.
+proxy_on || true
