@@ -29,9 +29,9 @@ When NAT fallback is active, the Windows proxy client must accept non-loopback c
 ## Validation Commands
 
 Run from the repository root in PowerShell unless noted. Nothing here may assume
-a particular checkout path. Steps
-1 and 2 change nothing and are the minimum after any edit. Steps 3 to 7 touch
-real Windows and WSL state, so run them when the change affects behavior.
+a particular checkout path. Steps 1 and 2 change nothing and are the minimum
+after any edit. Steps 3 to 7 touch real Windows and WSL state, so run them when
+the change affects behavior. Step 8 is a manual read, not a command.
 
 Run the suite under Windows PowerShell 5.1 at least once. It is the version the
 TLS 1.2 fallback and the BOM-less config writer exist for, and PowerShell 7
@@ -39,9 +39,9 @@ formats `config.json` differently.
 
 ### Run It In One Pass
 
-`run-validation.ps1` performs every check below and prints one `PASS`, `FAIL`,
-`SKIP`, or `INFO` line each, with a summary and a non-zero exit code when
-anything failed:
+`run-validation.ps1` automates steps 1 to 7 below, section for section and in
+the same order, and prints one `PASS`, `FAIL`, `SKIP`, or `INFO` line per check,
+with a summary and a non-zero exit code when anything failed:
 
 ```powershell
 .\run-validation.ps1           # steps 1 and 2 only, changes nothing
@@ -59,7 +59,7 @@ so output cannot be captured by assignment or `Tee-Object` in the same process.
 The steps below describe what each check asserts, and are the reference when a
 check fails or when a new one needs writing.
 
-### 1. Parse And Syntax Checks
+### 1. Parse And Syntax
 
 Both scripts must parse:
 
@@ -129,13 +129,25 @@ $config.enableWslMirrored = $original
 $config | ConvertTo-Json -Depth 4 | Set-Content .\config.json
 ```
 
-### 3. Apply
+### 3. Apply And Idempotence
 
-Start the local proxy client first, then:
+Start the local proxy client first, then apply twice. Re-running must not
+accumulate side effects:
 
 ```powershell
+(Get-Item .\config.json).LastWriteTime
+Get-ChildItem "$env:USERPROFILE\.wslconfig*" | Select-Object Name, LastWriteTime
+
 .\dev-proxy.ps1 -NonInteractive -Distro Ubuntu-24.04
+.\dev-proxy.ps1 -NonInteractive -Distro Ubuntu-24.04
+
+(Get-Item .\config.json).LastWriteTime
+Get-ChildItem "$env:USERPROFILE\.wslconfig*" | Select-Object Name, LastWriteTime
 ```
+
+Both runs end with exit code `0`. The second prints
+`[ OK ] ...\.wslconfig already has mirrored networking settings`, adds no `.bak`
+file, and leaves both timestamps unchanged.
 
 In a non-elevated shell the WinHTTP step must decline and print the command
 instead of failing or elevating:
@@ -152,31 +164,23 @@ restarts. Run `wsl --shutdown` after saving work in WSL before trusting steps 5
 and 6, otherwise expect `DEV_PROXY_HOST_SOURCE=nat-gateway` and
 `proxy_tcp=unreachable` from a proxy client bound to loopback only.
 
-Confirm what landed in the registry:
+### 4. Windows State
+
+Confirm what landed on the Windows side:
 
 ```powershell
 Get-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings" |
     Select-Object ProxyEnable, ProxyServer, ProxyOverride
+(Get-Item "HKCU:\Environment").Property | Where-Object { $_ -match "proxy" }
 ```
 
-### 4. Idempotence
+`ProxyOverride` ends in `<local>` and reflects `noProxy`. The registry lists
+four proxy variable names, not eight: Windows environment variable names are
+case-insensitive, so the upper-case and lower-case spellings the tool writes
+collapse into the same four values. Reading any of the eight names back must
+return the configured value.
 
-Re-running must not accumulate side effects:
-
-```powershell
-(Get-Item .\config.json).LastWriteTime
-Get-ChildItem "$env:USERPROFILE\.wslconfig*" | Select-Object Name, LastWriteTime
-
-.\dev-proxy.ps1 -NonInteractive -Distro Ubuntu-24.04
-
-(Get-Item .\config.json).LastWriteTime
-Get-ChildItem "$env:USERPROFILE\.wslconfig*" | Select-Object Name, LastWriteTime
-```
-
-The second run prints `[ OK ] ...\.wslconfig already has mirrored networking settings`,
-adds no `.bak` file, and leaves both timestamps unchanged.
-
-### 5. Verification And Exit Code
+### 5. Verification Exit Codes
 
 ```powershell
 .\verify-dev-proxy.ps1
@@ -219,7 +223,7 @@ is set, and `unresolved` only when no host was found at all. A resolved host
 reported as `unresolved` means the source is being assigned inside a subshell
 again. After `proxy_off`, both it and `HTTP_PROXY` return to their unset markers.
 
-### 7. Rollback
+### 7. Rollback And Restore
 
 `-Disable` asks for confirmation and defaults to No, so pressing Enter aborts
 the rollback and leaves everything in place. Answer `y`, or pass
@@ -242,7 +246,8 @@ with a different prefix is left alone and will produce a second entry.
 
 ### 8. Boundary Check
 
-The tool writes only these locations. Anything outside them is a regression:
+Not automated; read it yourself after any change that touches file or registry
+writes. The tool writes only these locations. Anything outside them is a regression:
 
 - `HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings`
 - User-scope proxy environment variables

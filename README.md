@@ -66,6 +66,29 @@ Rollback:
 .\dev-proxy.ps1 -Disable
 ```
 
+## Command Line
+
+`dev-proxy.ps1` takes these parameters. With none of them it opens the menu.
+
+| Parameter | Effect |
+| --- | --- |
+| `-ProxyHost <name>` | Override the saved proxy host for this run. |
+| `-ProxyPort <n>` | Override the saved port. Values outside 1-65535 warn and fall back. |
+| `-ProxyScheme http\|https` | Override the saved scheme. |
+| `-Distro <name>` | Use this WSL distro instead of the saved one. |
+| `-NonInteractive` | Apply Windows and WSL setup without prompting, then verify. |
+| `-Verify` | Run verification only. Exits `0` when clean, `1` on any failure. |
+| `-Disable` | Roll back everything this tool configured. |
+| `-DryRun` | Print what would change and write nothing. |
+
+`-Verify` and `-Disable` do not save `config.json`, so an override passed
+alongside them applies to that run only. Every other combination saves the
+resolved target.
+
+`verify-dev-proxy.ps1` is a shortcut for `-Verify` and passes its exit code
+through. `run-validation.ps1` checks the tool itself rather than the proxy; see
+`AGENTS.md`.
+
 ## Configuration
 
 `config.json` stores the local target and WSL preference. It holds per-machine
@@ -181,7 +204,9 @@ Run:
 .\dev-proxy.ps1 -Disable
 ```
 
-Rollback disables the Windows user system proxy, clears the user-level proxy environment variables, resets WinHTTP when PowerShell is elevated, and comments out the WSL profile source line. Existing provider credentials and app-specific configs are not touched.
+Menu option `7. Disable / rollback` does the same thing. Either way it asks for confirmation and defaults to No, so pressing Enter aborts and leaves everything in place. Answer `y`, or add `-NonInteractive` to skip the prompt.
+
+Rollback disables the Windows user system proxy, clears the user-level proxy environment variables, resets WinHTTP when PowerShell is elevated, and comments out the WSL profile source line. Running it again reports that the profile line is already disabled and adds no second backup; a later setup re-enables that line instead of appending a duplicate. Existing provider credentials and app-specific configs are not touched.
 
 ## Contact
 Contact me in [linux.do](https://linux.do/): https://linux.do/u/wowayou/summary

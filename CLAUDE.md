@@ -38,6 +38,6 @@ From the repository root:
 template syntax check too, by piping the file into `bash -n`, so no separate WSL
 command is needed. See `AGENTS.md` for what each step asserts.
 
-Expected connectivity signals include `proxy_tcp=reachable`, `PASS_OPENAI`, and `PASS_ANTHROPIC`. HTTP `401`, `403`, or `404` can be acceptable because they prove the request reached the provider without credentials.
+Expected connectivity signals include `DEV_PROXY_HOST_SOURCE=mirrored-localhost`, `proxy_tcp=reachable`, `PASS_OPENAI`, and `PASS_ANTHROPIC`. Under NAT the source reads `nat-gateway` instead, which is only healthy when the proxy client accepts non-loopback connections. HTTP `401`, `403`, or `404` can be acceptable because they prove the request reached the provider without credentials.
 
 After edits, verify that CC Switch remains untouched and that provider secrets/configs were not read or changed.
