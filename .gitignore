@@ -4,49 +4,22 @@ Thumbs.db
 Desktop.ini
 *.swp
 *.swo
-*.tmp
-*.temp
-*.bak
-*.orig
 *~
 
-# Local environment and secrets
-.env
-.env.*
-!.env.example
-
-# Logs and runtime output
+# Local backups and scratch copies
+*.bak
+*.bak.*
+*.orig
+*.tmp
 *.log
-logs/
-*.pid
-*.pid.lock
 
-# PowerShell artifacts
-*.ps1xml
-*.pssc
-*.psrc
-*.psd1.tmp
-
-# Test and tool caches
-.pytest_cache/
-.ruff_cache/
-.mypy_cache/
-.coverage
-coverage/
-
-# Node/package manager caches, if docs tooling is added locally
-node_modules/
-.npm/
-.pnpm-store/
-
-# Local-only config variants. config.json holds per-machine settings the tool
+# Local-only config. config.json holds the per-machine settings the tool
 # regenerates on first run; config.example.json is the tracked template.
 config.json
 config.local.json
 config.*.local.json
 
-# Generated archives and release bundles
+# Generated archives
 *.zip
 *.tar
 *.tar.gz
-*.tgz

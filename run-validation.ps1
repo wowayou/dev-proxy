@@ -133,6 +133,36 @@ if (Test-Path $ConfigPath) {
     Add-Result -Name "config.json checks" -Status "SKIP" -Detail "no config.json yet; it is written on first run"
 }
 
+# AGENTS.md requires config.example.json to stay in step with Get-DefaultConfig.
+# Read the keys out of the function's AST so the rule is enforced, not just stated.
+try {
+    $astTokens = $null
+    $astErrors = $null
+    $toolAst = [System.Management.Automation.Language.Parser]::ParseFile($ToolPath, [ref]$astTokens, [ref]$astErrors)
+    $defaultFn = $toolAst.Find({
+        param($node)
+        $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq "Get-DefaultConfig"
+    }, $true)
+    $hashAst = if ($defaultFn) {
+        $defaultFn.Find({ param($node) $node -is [System.Management.Automation.Language.HashtableAst] }, $true)
+    } else { $null }
+
+    if (-not $hashAst) {
+        Add-Check "config.example.json matches Get-DefaultConfig" $false "could not locate Get-DefaultConfig in dev-proxy.ps1"
+    } else {
+        $defaultKeys = @($hashAst.KeyValuePairs | ForEach-Object { $_.Item1.Extent.Text })
+        $exampleKeys = @((Get-Content $ExamplePath -Raw | ConvertFrom-Json).PSObject.Properties.Name)
+        $missing = @($defaultKeys | Where-Object { $_ -notin $exampleKeys })
+        $extra = @($exampleKeys | Where-Object { $_ -notin $defaultKeys })
+        $detail = @()
+        if ($missing) { $detail += "missing: $($missing -join ', ')" }
+        if ($extra) { $detail += "unexpected: $($extra -join ', ')" }
+        Add-Check "config.example.json matches Get-DefaultConfig" (($missing.Count + $extra.Count) -eq 0) ($detail -join "; ")
+    }
+} catch {
+    Add-Check "config.example.json matches Get-DefaultConfig" $false $_.Exception.Message
+}
+
 $hasWsl = [bool](Get-Command wsl.exe -ErrorAction SilentlyContinue)
 if ($hasWsl) {
     # Hand the template to bash over stdin rather than translating its path.

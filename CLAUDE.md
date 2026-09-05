@@ -1,6 +1,6 @@
 # Dev Proxy Maintenance Notes
 
-This is a standalone Windows and WSL ops tool. Maintain it in place at `C:\Users\Public\ops-tools\dev-proxy`; do not couple it back into the `cc-switch` repository.
+This is a standalone Windows and WSL ops tool. Its deployment location is `C:\Users\Public\ops-tools\dev-proxy`, but nothing may depend on that path: the scripts and the commands in these notes must work from whatever directory the repository sits in. Do not couple it back into the `cc-switch` repository.
 
 ## Operating Boundaries
 
@@ -27,21 +27,16 @@ When it is `false`, non-interactive setup must still install the WSL shell proxy
 
 ## Verification
 
-From `C:\Users\Public\ops-tools\dev-proxy`:
+From the repository root:
 
 ```powershell
 .\run-validation.ps1           # parse, JSON, BOM, template syntax, dry run
 .\run-validation.ps1 -Full     # also apply, verify, WSL helpers, rollback, restore
 ```
 
-`run-validation.ps1` exits non-zero when any check fails. See `AGENTS.md` for
-what each step asserts.
-
-From WSL:
-
-```bash
-bash -n /mnt/c/Users/Public/ops-tools/dev-proxy/templates/wsl-proxy-env.sh
-```
+`run-validation.ps1` exits non-zero when any check fails. It covers the WSL
+template syntax check too, by piping the file into `bash -n`, so no separate WSL
+command is needed. See `AGENTS.md` for what each step asserts.
 
 Expected connectivity signals include `proxy_tcp=reachable`, `PASS_OPENAI`, and `PASS_ANTHROPIC`. HTTP `401`, `403`, or `404` can be acceptable because they prove the request reached the provider without credentials.
 

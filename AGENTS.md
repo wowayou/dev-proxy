@@ -28,7 +28,8 @@ When NAT fallback is active, the Windows proxy client must accept non-loopback c
 
 ## Validation Commands
 
-Run from `C:\Users\Public\ops-tools\dev-proxy` in PowerShell unless noted. Steps
+Run from the repository root in PowerShell unless noted. Nothing here may assume
+a particular checkout path. Steps
 1 and 2 change nothing and are the minimum after any edit. Steps 3 to 7 touch
 real Windows and WSL state, so run them when the change affects behavior.
 

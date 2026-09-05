@@ -23,7 +23,8 @@ It does not edit CC Switch databases, Claude provider files, Codex provider file
 
 ## Recommended Setup
 
-Open PowerShell in `C:\Users\Public\ops-tools\dev-proxy`:
+Open PowerShell in the tool directory. The recommended deployment location is
+`C:\Users\Public\ops-tools\dev-proxy`, but the scripts run from anywhere:
 
 ```powershell
 .\dev-proxy.ps1
@@ -128,7 +129,9 @@ NAT fallback only works when your proxy client accepts non-loopback connections,
 
 ## Validation Signals
 
-Use option 5 or `.\verify-dev-proxy.ps1`.
+Use option 5 or `.\verify-dev-proxy.ps1`. To check the tool itself rather than
+the proxy, `.\run-validation.ps1` runs the maintenance suite described in
+`AGENTS.md` and exits non-zero on any failure.
 
 Healthy WSL output usually includes:
 

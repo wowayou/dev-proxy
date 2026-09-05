@@ -101,7 +101,7 @@ function Read-YesNo($Prompt, [bool]$Default = $true) {
 function Get-DefaultConfig {
     [pscustomobject]@{
         proxyHost = "127.0.0.1"
-        proxyPort = 20122
+        proxyPort = $DefaultProxyPort
         proxyScheme = "http"
         noProxy = "localhost,127.0.0.1,::1,.local"
         distro = $null
