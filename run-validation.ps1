@@ -135,15 +135,14 @@ if (Test-Path $ConfigPath) {
 
 $hasWsl = [bool](Get-Command wsl.exe -ErrorAction SilentlyContinue)
 if ($hasWsl) {
-    $winPath = (Resolve-Path $TemplatePath).Path
-    $wslPath = (& wsl.exe -- wslpath -u "$winPath" 2>$null | Select-Object -First 1)
-    $wslPath = ("$wslPath" -replace "`0", "").Trim()
-    if ($wslPath) {
-        & wsl.exe -- bash -n "$wslPath" 2>&1 | Out-Null
-        Add-Check "bash -n templates/wsl-proxy-env.sh" ($LASTEXITCODE -eq 0)
-    } else {
-        Add-Check "bash -n templates/wsl-proxy-env.sh" $false "wslpath returned nothing for $winPath"
-    }
+    # Hand the template to bash over stdin rather than translating its path.
+    # A path-based check needs the checkout to be reachable from inside WSL,
+    # which depends on where it was cloned and on how drives are mounted; the
+    # file content is always available on this side.
+    $templateText = ((Get-Content $TemplatePath -Raw) -replace "`r`n", "`n") -replace "`r", "`n"
+    $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($templateText))
+    $syntax = & wsl.exe -- bash -c "printf '%s' '$encoded' | base64 -d | bash -n" 2>&1
+    Add-Check "bash -n templates/wsl-proxy-env.sh" ($LASTEXITCODE -eq 0) (@($syntax | ForEach-Object { "$_" }) -join " ")
 } else {
     Add-Result -Name "WSL template syntax" -Status "SKIP" -Detail "wsl.exe not found"
 }

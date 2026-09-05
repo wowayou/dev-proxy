@@ -84,13 +84,14 @@ if (Test-Path .\config.json) { Get-Content .\config.json -Raw | ConvertFrom-Json
 if (Test-Path .\config.json) { '{0:X2}' -f [IO.File]::ReadAllBytes((Resolve-Path .\config.json))[0] }
 ```
 
-WSL template syntax check. Resolve the path from the current directory so the
-check works from any checkout, and read the exit code rather than trusting a
-trailing string:
+WSL template syntax check. Pipe the file in rather than naming a path, so the
+check does not depend on the checkout being reachable from inside WSL, and read
+the exit code rather than trusting a trailing string:
 
 ```powershell
-$sh = wsl.exe -- wslpath -u "$((Resolve-Path .\templates\wsl-proxy-env.sh).Path)"
-wsl.exe -- bash -n "$sh"
+$text = ((Get-Content .\templates\wsl-proxy-env.sh -Raw) -replace "`r`n", "`n") -replace "`r", "`n"
+$b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($text))
+wsl.exe -- bash -c "printf '%s' '$b64' | base64 -d | bash -n"
 if ($LASTEXITCODE -eq 0) { "bash -n ok" } else { "bash -n FAILED" }
 ```
 
