@@ -12,6 +12,8 @@ Desktop.ini
 *.orig
 *.tmp
 *.log
+__pycache__/
+*.pyc
 
 # Local-only config. config.json holds the per-machine settings the tool
 # regenerates on first run; config.example.json is the tracked template.

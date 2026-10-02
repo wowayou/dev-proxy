@@ -14,17 +14,39 @@ This directory is a standalone ops tool. Keep it decoupled from the `cc-switch` 
 
 - Keep `dev-proxy.ps1`, `config.example.json`, `templates/wsl-proxy-env.sh`, and local docs self-contained.
 - `config.json` is per-machine state and is not tracked. Keep `config.example.json` in step with `Get-DefaultConfig`, and never commit a real `config.json`.
-- Preserve `enableWslMirrored` as a visible preference, not a hidden compatibility field.
+- Preserve `enableWslMirrored` and `enableWslInteropFallback` as visible preferences, not hidden compatibility fields.
 - Preserve WSL commands: `proxy_status`, `proxy_refresh`, and `proxy_off`.
 - Preserve dynamic NAT host detection. Use `DEV_PROXY_HOST_OVERRIDE` only as an intentional fixed-host override.
 - Suppress noisy localized `netsh` output and WSL PATH translation warnings in tool output.
 - Avoid coupling validation to live provider credentials. HTTP `401`, `403`, or `404` can still be a connectivity pass.
 
+## Reliability-Review Execution Boundary
+
+For the 2026-10-01 reliability review, do not stop or reconfigure an existing
+relay, proxy client, WSL distribution, or user-wide proxy state merely to run
+validation. Use isolated fixtures, parser/template checks, and read-only live
+checks unless the owner explicitly authorizes a state-changing run. In
+particular, a review result must not claim that reboot, sleep/resume, WSL
+shutdown, full rollback, or a long soak was tested when it was not. Record
+those as untested limits in `RELIABILITY-AUDIT.md`.
+
+The normal mirrored path is direct WSL access to the configured Windows proxy
+listener (normally `127.0.0.1:20122`). When that path is unreachable and
+`enableWslInteropFallback` is enabled, Linux IPv6 loopback
+(`[::1]:wslInteropPort`) reaches the listener through one Windows PowerShell
+interop process per active non-empty connection. The relay's current
+operational limits are 32 active connections, a 10-second first-byte wait, and
+a 3-second response-drain window after client EOF; healthy streaming
+connections may remain open indefinitely. NAT mode uses only the WSL
+default-route gateway, selected from `wslinfo --networking-mode` and route
+state. Python 3, Windows interop, and Linux IPv6 loopback are prerequisites.
+The loopback listener is a transport boundary, not user authentication.
+
 ## Mirrored Vs NAT Reasoning
 
-Mirrored networking lets WSL use the Windows proxy listener at `127.0.0.1:<port>`. NAT mode cannot rely on Windows localhost, so the WSL profile falls back to the default-route gateway, often similar to `172.17.0.1`.
+Mirrored networking normally lets WSL use the Windows proxy listener at `127.0.0.1:<port>`. The interop bridge uses Linux IPv6 loopback when the IPv4 mirrored path fails. Determine the mode with WSL's `wslinfo --networking-mode`; do not infer mirrored mode from a successful loopback TCP connection. NAT mode cannot rely on Windows localhost, so the WSL profile uses the default-route gateway, often similar to `172.17.0.1`.
 
-When NAT fallback is active, the Windows proxy client must accept non-loopback connections. That usually means LAN access, a `0.0.0.0` listener, and compatible firewall rules.
+When NAT fallback is active, the Windows proxy client must accept connections on a specific Windows address reachable from WSL, with firewall rules limited to the required sources. Do not recommend opening the proxy to the whole LAN.
 
 ## Validation Commands
 
@@ -96,6 +118,9 @@ wsl.exe -- bash -c "printf '%s' '$b64' | base64 -d | bash -n"
 if ($LASTEXITCODE -eq 0) { "bash -n ok" } else { "bash -n FAILED" }
 ```
 
+`run-validation.ps1` also substitutes harmless values for the placeholders in
+`templates/wsl-interop-proxy.py` and compiles it with WSL `python3`.
+
 ### 2. Dry Run
 
 ```powershell
@@ -149,7 +174,7 @@ Get-ChildItem "$env:USERPROFILE\.wslconfig*" | Select-Object Name, LastWriteTime
 ```
 
 Both runs end with exit code `0`. The second prints
-`[ OK ] ...\.wslconfig already has mirrored networking settings`, adds no `.bak`
+`[ OK ] ...\.wslconfig already has mirrored networking settings managed by dev-proxy`, adds no `.bak`
 file, and leaves both timestamps unchanged.
 
 In a non-elevated shell the WinHTTP step must decline and print the command
@@ -164,8 +189,8 @@ becomes `[ OK ] WinHTTP proxy imported ...`.
 
 If `.wslconfig` was changed, mirrored networking is not active until WSL
 restarts. Run `wsl --shutdown` after saving work in WSL before trusting steps 5
-and 6, otherwise expect `DEV_PROXY_HOST_SOURCE=nat-gateway` and
-`proxy_tcp=unreachable` from a proxy client bound to loopback only.
+and 6, otherwise expect stale networking behavior and
+`proxy_tcp=unreachable`.
 
 ### 4. Windows State
 
@@ -191,15 +216,24 @@ $LASTEXITCODE
 ```
 
 A healthy run ends with `[ OK ] Verification finished with no failures` and exit
-code `0`. The WSL section should include:
+code `0`. When direct mirrored localhost is healthy, the WSL section should
+include:
 
 ```text
+DEV_PROXY_NETWORKING_MODE=mirrored
 DEV_PROXY_HOST=127.0.0.1
 DEV_PROXY_HOST_SOURCE=mirrored-localhost
 proxy_tcp=reachable
+PASS_PROXY_TCP
 PASS_OPENAI
 PASS_ANTHROPIC
 ```
+
+If direct candidates are unreachable and the fallback is enabled,
+`mirrored-interop` with host `::1` is also healthy: it is a Linux-local IPv6
+listener that reaches the existing Windows loopback proxy through WSL interop.
+A VMware-only address is not a valid substitute when `ip route get` sends it
+to the LAN gateway.
 
 HTTP `401`, `403`, or `404` still counts as a pass. For the negative case, point
 the check at a port nothing listens on and expect `[FAIL]` lines, a
@@ -231,10 +265,11 @@ in `dev-proxy.ps1` reports failures this way, rollback included.
 wsl.exe -d Ubuntu-24.04 -- bash -lc "proxy_status; proxy_refresh; proxy_status; proxy_off; proxy_status"
 ```
 
-All three helpers must exist. `DEV_PROXY_HOST_SOURCE` must agree with the host
-on the line above it: `mirrored-localhost` with `127.0.0.1`, `nat-gateway` with a
-vEthernet address such as `172.17.0.1`, `override` when `DEV_PROXY_HOST_OVERRIDE`
-is set, and `unresolved` only when no host was found at all. A resolved host
+All three helpers must exist and `DEV_PROXY_NETWORKING_MODE` must be `mirrored`
+or `nat`. `DEV_PROXY_HOST_SOURCE` must agree with the host on the line above it:
+`mirrored-interop` with `::1`, `mirrored-localhost` with `127.0.0.1`, `mirrored-host-address` with a non-loopback
+Windows address, `nat-gateway` with a vEthernet address such as `172.17.0.1`,
+`override` when `DEV_PROXY_HOST_OVERRIDE` is set, and `unresolved` only when no host was found at all. A resolved host
 reported as `unresolved` means the source is being assigned inside a subshell
 again. After `proxy_off`, both it and `HTTP_PROXY` return to their unset markers.
 
@@ -259,6 +294,11 @@ later install must re-enable that line rather than append a duplicate. Only
 lines this tool commented out are recognized; a source line disabled by hand
 with a different prefix is left alone and will produce a second entry.
 
+Rollback also restores the exact prior `.wslconfig` lines recorded by the
+tool's management comments, including `autoProxy`, and removes an added
+`hostAddressLoopback` line. It must preserve unrelated comments and settings
+and back up the file before restoration.
+
 ### 8. Boundary Check
 
 Not automated; read it yourself after any change that touches file or registry
@@ -267,15 +307,15 @@ writes. The tool writes only these locations. Anything outside them is a regress
 - `HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings`
 - User-scope proxy environment variables
 - `%USERPROFILE%\.wslconfig` and its `.bak` copies
-- WSL `~/.config/dev-proxy/proxy-env.sh` and `~/.profile`
+- WSL `~/.config/dev-proxy/` generated proxy scripts and private runtime state, and `~/.profile` with its backups
 - `config.json` in the tool directory
 
 CC Switch databases, provider configs, and API keys must be untouched.
 
 ### Interactive Smoke Checks
 
-- Option 1 saves the proxy target, the bypass list, and `enableWslMirrored`, and rejects an out-of-range port or an unknown scheme.
-- Option 4 explains mirrored networking and NAT fallback, then persists `enableWslMirrored`.
+- Option 1 saves the proxy target, the bypass list, `enableWslMirrored`, and `enableWslInteropFallback`, and rejects an out-of-range port or an unknown scheme.
+- Option 4 explains mirrored direct access, the optional interop fallback, and NAT fallback, then persists the saved preferences.
 - Option 5 reports Windows and WSL verification without raw localized `netsh` noise, and ends with a failure-count summary.
 - Option 6 prints CC Switch paths only; it does not edit CC Switch.
 

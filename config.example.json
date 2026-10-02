@@ -4,5 +4,7 @@
   "proxyScheme": "http",
   "noProxy": "localhost,127.0.0.1,::1,.local",
   "distro": null,
-  "enableWslMirrored": true
+  "enableWslMirrored": true,
+  "enableWslInteropFallback": true,
+  "wslInteropPort": 20180
 }

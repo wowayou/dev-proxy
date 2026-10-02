@@ -102,7 +102,9 @@ template:
   "proxyScheme": "http",
   "noProxy": "localhost,127.0.0.1,::1,.local",
   "distro": null,
-  "enableWslMirrored": true
+  "enableWslMirrored": true,
+  "enableWslInteropFallback": true,
+  "wslInteropPort": 20180
 }
 ```
 
@@ -115,6 +117,18 @@ Copy-Item .\config.example.json .\config.json
 ```
 
 `distro` is filled in by menu option 3 or by passing `-Distro`.
+
+`wslInteropPort` is the Linux-local IPv6 relay port (default `20180`). It is
+independent of the Windows proxy listener at `127.0.0.1:20122`. During a
+parallel migration you may intentionally install a second generation on
+`20181`, verify it, and switch new shells; do not stop the existing `20180`
+relay while old connections still use it.
+
+`enableWslInteropFallback` keeps that relay as a fallback instead of the normal
+mirrored path. With the default `true`, WSL first tries the configured Windows
+listener directly (normally `127.0.0.1:20122`) and starts the `[::1]` relay only
+when every direct mirrored candidate is unreachable. Set it to `false` to
+disable relay startup without disabling mirrored networking itself.
 
 `enableWslMirrored` is a visible user preference. The menu header shows it, options 1 and 4 both let you change it, and both save the answer back to `config.json`. `noProxy` feeds the CLI bypass variables and the Windows system-proxy bypass list; entries that start with a dot, such as `.local`, are rewritten to the `*.local` form WinINet expects. Values are validated on load, so an out-of-range port or an unknown scheme falls back to the default with a warning instead of being written to the registry. In `-NonInteractive` mode, `.wslconfig` mirrored settings are applied only when this value is `true`; the WSL shell proxy environment is still installed either way.
 
@@ -141,14 +155,41 @@ Option 4 installs a shell profile for the selected distro. New WSL shells source
 - `proxy_refresh`
 - `proxy_off`
 
-`proxy_status` reports `DEV_PROXY_HOST_SOURCE` as `mirrored-localhost`, `nat-gateway`, or `override`, which is usually the fastest way to tell which networking mode is actually in effect.
+After installing or migrating the profile, use a new WSL terminal or run
+`source ~/.profile` in an existing Bash shell. `proxy_refresh` re-resolves the
+relay for the current shell, but it cannot replace environment variables or
+runtime functions already captured by an older shell/profile generation.
 
-The WSL profile dynamically resolves the Windows proxy host:
+`proxy_status` reports `DEV_PROXY_NETWORKING_MODE` and identifies `DEV_PROXY_HOST_SOURCE` as `mirrored-interop`, `mirrored-localhost`, `mirrored-host-address`, `nat-gateway`, or `override`.
 
-- Mirrored networking: WSL can use the Windows proxy at `127.0.0.1:20122`.
-- NAT fallback: WSL uses the Windows vEthernet gateway, for example `172.17.0.1`.
+The WSL profile dynamically resolves the Windows proxy host, using
+`wslinfo --networking-mode` as the authoritative mode signal:
 
-NAT fallback only works when your proxy client accepts non-loopback connections, such as LAN access or a `0.0.0.0` listener. Set `DEV_PROXY_HOST_OVERRIDE` only when you intentionally want to pin a fixed host; otherwise leave host detection dynamic.
+- Mirrored networking: WSL first tries the configured Windows listener directly
+  (normally `127.0.0.1:20122`). If that path is unreachable and
+  `enableWslInteropFallback` is enabled, the generated relay listens only on
+  Linux IPv6 loopback (`[::1]:20180` by default). For each relay connection
+  that sends data, it starts one Windows PowerShell interop process, which
+  connects to the existing Windows listener and copies bytes in both
+  directions. An empty TCP probe does not start a Windows child.
+- NAT fallback: WSL uses the current default-route gateway (normally a
+  Windows vEthernet address such as `172.17.0.1`), never Windows localhost.
+  The Windows proxy client must explicitly accept that address and a narrowly
+  scoped firewall rule; the tool does not change proxy-client configuration.
+- `DEV_PROXY_HOST_OVERRIDE` is an intentional fixed-host override, not a
+  replacement for dynamic mode detection.
+
+Option 4 backs up `.wslconfig`, enables mirrored networking, and sets global
+WSL2 `autoProxy=false`. A new install does not add `hostAddressLoopback` or
+`ignoredPorts`; the IPv6 loopback relay does not need either setting. Legacy
+management markers for those keys remain understood until an explicit
+rollback, which can restore their prior values. The selected distro's Bash
+login profile is the only source that injects proxy environment variables.
+Managed values carry comments that let option 7 restore the prior managed
+`.wslconfig` lines without replacing unrelated memory, swap, crash-dump, or
+experimental settings.
+
+NAT fallback only works when the proxy client accepts non-loopback connections. Prefer one explicit host address plus a firewall rule limited to the required source over a `0.0.0.0` listener. Set `DEV_PROXY_HOST_OVERRIDE` only when you intentionally want to pin a fixed host; otherwise leave host detection dynamic.
 
 ## Validation Signals
 
@@ -156,18 +197,24 @@ Use option 5 or `.\verify-dev-proxy.ps1`. To check the tool itself rather than
 the proxy, `.\run-validation.ps1` runs the maintenance suite described in
 `AGENTS.md` and exits non-zero on any failure.
 
-Healthy WSL output usually includes:
+Healthy WSL output normally uses the direct mirrored path:
 
 ```text
+DEV_PROXY_NETWORKING_MODE=mirrored
+DEV_PROXY_HOST=127.0.0.1
 DEV_PROXY_HOST_SOURCE=mirrored-localhost
 proxy_tcp=reachable
+PASS_PROXY_TCP
 PASS_OPENAI
 PASS_ANTHROPIC
 ```
 
+When direct mirrored localhost is broken and the fallback is enabled, the host
+and source instead become `::1` and `mirrored-interop`.
+
 The run ends with a summary line and, for `-Verify`, a matching exit code.
 
-HTTP `401`, `403`, or `404` from API endpoints is acceptable during these checks. It means the request reached the provider without credentials. A network timeout, connection refused, or missing `HTTP/` response is the problem to investigate.
+HTTP `401`, `403`, or `404` from API endpoints is acceptable during these checks. Verification tests the proxy TCP port first and the HTTPS tunnel second. It labels TCP timeout/refusal separately and reports curl exit 28 (timeout) separately from exit 7 (connection failure).
 
 ## Troubleshooting
 
@@ -182,7 +229,58 @@ If mirrored networking is disabled or unavailable, confirm these points:
 - Your Windows proxy client is listening beyond `127.0.0.1`.
 - Windows Firewall allows the proxy listener for the relevant network profile.
 
-If mirrored networking is enabled, run `wsl --shutdown` after `.wslconfig` changes, then reopen WSL.
+If mirrored networking is enabled, run `wsl --shutdown` after `.wslconfig` changes, then reopen WSL. The tool does not add `hostAddressLoopback`; native `127.0.0.1` and the Linux-local IPv6 fallback do not require it. If you separately expose additional Windows IPv4 addresses, the proxy must actually listen on an address that WSL mirrors. A VMware-only address, for example, may still route toward the LAN gateway instead of the Windows host.
+
+A report in [microsoft/WSL#40343](https://github.com/microsoft/WSL/issues/40343) describes mirrored-mode TCP failures involving incorrect reply ports. Similar localhost timeouts do not prove that a particular machine has that exact defect; no local packet capture establishes that diagnosis. The IPv6-local interop bridge is a narrow workaround: it remains bound only to WSL localhost, and does not repair WSL's networking stack, edit proxy-client configuration, or create firewall rules.
+
+## Reliability And Limits
+
+The bridge is a local development fallback, not a VPN or a replacement for
+sing-box. Windows applications connect to the Windows proxy directly. WSL
+applications that inherit the generated environment normally use the mirrored
+Windows listener directly; only when that path is unreachable and the fallback
+is enabled do they connect to Linux IPv6 loopback, where the bridge copies TCP
+bytes through Windows interop to the configured Windows proxy. It does not
+decrypt HTTPS.
+
+- Only applications that honor the proxy variables are covered. A shell that
+  does not source `~/.profile`, a service, container, another Linux user, or an
+  already-running application can retain different settings. The generated
+  profile is intended for Bash; it is not a universal shell startup hook.
+- UDP, QUIC, ICMP, arbitrary system traffic, and DNS for applications making
+  direct connections are outside the bridge's scope.
+- `proxy_off` affects only the current shell and its future child processes.
+  It does not rewrite the environment of existing processes or disconnect
+  their established requests.
+- The interop path depends on Python 3, Linux IPv6 loopback, WSL Windows-process
+  interoperability, and a running Windows proxy. Each active connection has
+  the cost of a Windows PowerShell process; this is not a high-throughput
+  multi-user proxy service. The relay caps active connections at 32, waits up
+  to 10 seconds for the first request bytes, and allows up to 3 seconds to
+  drain a response after client EOF before reaping the child. Healthy streaming
+  connections are not cut off by an idle-duration limit. That bounded
+  half-close drain can add latency or truncate a peer that needs more than
+  3 seconds to deliver its final response bytes.
+- An HTTP `401`, `403`, or `404` in verification proves network connectivity,
+  not valid API credentials, model permissions, quota, or successful inference.
+- HTTPS websites reached through an HTTP proxy are carried as opaque bytes; the
+  origin connection remains the application's responsibility. An HTTPS proxy
+  endpoint is different: its certificate name must match the proxy address
+  seen by the client. A certificate for the original Windows host may not be
+  valid for `[::1]`; TLS certificate validation is never disabled by the tool.
+- Rollback restores managed `.wslconfig` values, but the Windows side disables
+  proxy settings and clears proxy variables. It is not a snapshot restoration
+  of arbitrary Windows proxy settings that existed before installation.
+- `.wslconfig` is global to the user's WSL 2 distributions. Disabling
+  `autoProxy` affects all of them, although this tool installs the shell
+  profile only in the selected distribution.
+- A loopback listener prevents LAN access but is not authentication between
+  local users. Other processes with access to the same loopback interface can
+  connect to it. The runtime generation identifier detects stale processes;
+  it is not an API key or an access-control credential.
+
+See [the reliability audit](RELIABILITY-AUDIT.md) for concrete findings,
+regression checks, deployment evidence, and checks that have not been run.
 
 ## CC Switch Values
 
@@ -206,7 +304,7 @@ Run:
 
 Menu option `7. Disable / rollback` does the same thing. Either way it asks for confirmation and defaults to No, so pressing Enter aborts and leaves everything in place. Answer `y`, or add `-NonInteractive` to skip the prompt.
 
-Rollback disables the Windows user system proxy, clears the user-level proxy environment variables, resets WinHTTP when PowerShell is elevated, and comments out the WSL profile source line. Running it again reports that the profile line is already disabled and adds no second backup; a later setup re-enables that line instead of appending a duplicate. Existing provider credentials and app-specific configs are not touched.
+Rollback disables the Windows user system proxy, clears the user-level proxy environment variables, resets WinHTTP when PowerShell is elevated, stops every relay generation whose state identity is independently verified as managed by this tool, comments out the WSL profile source line, and restores only the `.wslconfig` lines managed by this tool. A legacy PID file without matching generation metadata (including `starttime`) is retained and reported rather than guessed or killed. It backs up `.wslconfig` before that restoration. Running it again reports no managed changes and adds no second profile backup; a later setup re-enables the profile line instead of appending a duplicate. Existing provider credentials, unrelated `.wslconfig` settings, and app-specific configs are not touched.
 
 ## Contact
 Contact me in [linux.do](https://linux.do/): https://linux.do/u/wowayou/summary

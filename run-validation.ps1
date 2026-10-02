@@ -17,6 +17,7 @@ $ToolPath = Join-Path $ScriptRoot "dev-proxy.ps1"
 $ConfigPath = Join-Path $ScriptRoot "config.json"
 $ExamplePath = Join-Path $ScriptRoot "config.example.json"
 $TemplatePath = Join-Path $ScriptRoot "templates\wsl-proxy-env.sh"
+$InteropTemplatePath = Join-Path $ScriptRoot "templates\wsl-interop-proxy.py"
 $InternetSettingsPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings"
 $ProxyEnvNames = @("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "all_proxy", "no_proxy")
 
@@ -187,6 +188,12 @@ if ($hasWsl) {
     $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($templateText))
     $syntax = & wsl.exe -- bash -c "printf '%s' '$encoded' | base64 -d | bash -n" 2>&1
     Add-Check "bash -n templates/wsl-proxy-env.sh" ($LASTEXITCODE -eq 0) (@($syntax | ForEach-Object { "$_" }) -join " ")
+
+    $interopText = Get-Content $InteropTemplatePath -Raw
+    $interopText = $interopText.Replace("__INTEROP_PORT__", "20180").Replace("__WINDOWS_RELAY_ENCODED__", "QQ==")
+    $encodedInterop = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($interopText))
+    $pythonSyntax = & wsl.exe -- bash -c "printf '%s' '$encodedInterop' | base64 -d | python3 -c 'import ast,sys; ast.parse(sys.stdin.read())'" 2>&1
+    Add-Check "parses: templates/wsl-interop-proxy.py" ($LASTEXITCODE -eq 0) (@($pythonSyntax | ForEach-Object { "$_" }) -join " ")
 } else {
     Add-Result -Name "WSL template syntax" -Status "SKIP" -Detail "wsl.exe not found"
 }
@@ -305,12 +312,15 @@ if (-not $Full) {
         $resolvedHost = ("$($before | Where-Object { $_ -like 'DEV_PROXY_HOST=*' } | Select-Object -First 1)" -replace "^DEV_PROXY_HOST=", "")
         $source = ("$($before | Where-Object { $_ -like 'DEV_PROXY_HOST_SOURCE=*' } | Select-Object -First 1)" -replace "^DEV_PROXY_HOST_SOURCE=", "")
         $consistent = switch ($source) {
+            "mirrored-interop" { $resolvedHost -eq "::1" }
             "mirrored-localhost" { $resolvedHost -eq "127.0.0.1" }
+            "mirrored-host-address" { $resolvedHost -and $resolvedHost -ne "127.0.0.1" -and $resolvedHost -ne "<unresolved>" }
             "nat-gateway" { $resolvedHost -and $resolvedHost -ne "127.0.0.1" -and $resolvedHost -ne "<unresolved>" }
             "override" { $resolvedHost -and $resolvedHost -ne "<unresolved>" }
             "unresolved" { $resolvedHost -eq "<unresolved>" }
             default { $false }
         }
+        Add-Check "networking mode is reported" ([bool]($before | Where-Object { $_ -match '^DEV_PROXY_NETWORKING_MODE=(mirrored|nat)$' }))
         Add-Check "host source agrees with resolved host" ([bool]$consistent) "$source / $resolvedHost"
         Add-Check "proxy_tcp reports reachable" ($before -contains "proxy_tcp=reachable") ($before | Where-Object { $_ -like "proxy_tcp=*" })
         Add-Check "proxy_off clears the environment" (($after -contains "HTTP_PROXY=<unset>") -and ($after -contains "DEV_PROXY_HOST_SOURCE=<unresolved>"))
@@ -327,6 +337,8 @@ if (-not $Full) {
             $reg = Get-ItemProperty $InternetSettingsPath
             Add-Check "rollback disables system proxy" ($reg.ProxyEnable -eq 0)
             Add-Check "rollback clears user env" ([string]::IsNullOrEmpty([Environment]::GetEnvironmentVariable("HTTP_PROXY", "User")))
+            $wslConfigAfterRollback = if (Test-Path "$env:USERPROFILE\.wslconfig") { Get-Content "$env:USERPROFILE\.wslconfig" -Raw } else { "" }
+            Add-Check "rollback removes .wslconfig management markers" (-not $wslConfigAfterRollback.Contains("# dev-proxy managed:"))
 
             $again = Invoke-DevProxy @("-Disable", "-NonInteractive")
             Add-Check "second rollback is a no-op" ([bool]($again.Text -match "already disabled"))
@@ -335,6 +347,10 @@ if (-not $Full) {
 
             $restore = Invoke-DevProxy $applyArgs
             Add-Check "restore succeeds" ($restore.ExitCode -eq 0) "exit $($restore.ExitCode)"
+            $wslConfigAfterRestore = if (Test-Path "$env:USERPROFILE\.wslconfig") { Get-Content "$env:USERPROFILE\.wslconfig" -Raw } else { "" }
+            Add-Check "restore enables mirrored networking" ($wslConfigAfterRestore -match '(?im)^networkingMode=mirrored\s*$')
+            Add-Check "restore enables WSL DNS tunneling" ($wslConfigAfterRestore -match '(?im)^dnsTunneling=true\s*$')
+            Add-Check "restore disables WSL autoProxy" ($wslConfigAfterRestore -match '(?im)^autoProxy=false\s*$')
             $activeLines = [int](Invoke-WslScript $Distro 'grep -cxF ''source "$HOME/.config/dev-proxy/proxy-env.sh"'' "$HOME/.profile"' | Select-Object -Last 1)
             Add-Check "profile has exactly one active source line" ($activeLines -eq 1) "found $activeLines"
         }
