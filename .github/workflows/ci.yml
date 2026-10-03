@@ -2,13 +2,15 @@ name: CI
 
 "on":
   push:
+    branches:
+      - main
   pull_request:
 
 permissions:
   contents: read
 
 jobs:
-  offline-tests:
+  linux-offline:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -22,9 +24,39 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Parse PowerShell and enforce ASCII compatibility
+        shell: pwsh
+        run: |
+          $failures = @()
+          foreach ($file in (Get-ChildItem -Recurse -Filter *.ps1)) {
+            $tokens = $null
+            $errors = $null
+            [Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors) { $failures += "$($file.FullName): $($errors -join '; ')" }
+          }
+          if ($failures) { throw ($failures -join [Environment]::NewLine) }
+          $nonAscii = @([IO.File]::ReadAllBytes((Resolve-Path ./dev-proxy.ps1)) | Where-Object { $_ -gt 0x7F })
+          if ($nonAscii.Count -ne 0) { throw "dev-proxy.ps1 contains $($nonAscii.Count) non-ASCII byte(s)" }
+
+      - name: Parse WSL shell template
+        run: bash -n templates/wsl-proxy-env.sh
+
       - name: Run Python isolation suites
         run: python -B -m unittest tests.test_shell_template tests.test_interop_runtime -v
 
       - name: Run PowerShell config fixture
         shell: pwsh
+        run: ./tests/test_config_review.ps1
+
+  windows-powershell51:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Run PowerShell config fixture
+        shell: powershell
         run: ./tests/test_config_review.ps1

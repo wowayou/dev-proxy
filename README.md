@@ -216,10 +216,12 @@ Use option 5 or `.\verify-dev-proxy.ps1`. To check the tool itself rather than
 the proxy, `.\run-validation.ps1` runs the maintenance suite described in
 `AGENTS.md` and exits non-zero on any failure.
 
-GitHub Actions also runs the offline Python shell/relay suites and the isolated
-PowerShell config fixture on Linux for every push and pull request. CI does not
-exercise a real Windows proxy, WSL installation, `.wslconfig`, or the
-state-changing `.\run-validation.ps1 -Full` path; those remain local checks.
+GitHub Actions parses every PowerShell script and the WSL shell template,
+enforces the Windows PowerShell 5.1 ASCII constraint on `dev-proxy.ps1`, runs
+the offline Python shell/relay suites and isolated config fixture on Linux, and
+runs that fixture again under Windows PowerShell 5.1. CI does not exercise a
+real Windows proxy, WSL installation, `.wslconfig`, or the state-changing
+`.\run-validation.ps1 -Full` path; those remain local checks.
 
 Healthy WSL output normally uses the direct mirrored path:
 

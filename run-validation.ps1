@@ -376,27 +376,51 @@ if (-not $Full) {
 
             $profileBackupsBefore = [int](Invoke-WslScript $Distro 'ls "$HOME"/.profile.dev-proxy.bak.* 2>/dev/null | wc -l' | Select-Object -Last 1)
 
-            $rollback = Invoke-DevProxy @("-Disable", "-NonInteractive")
-            Add-Check "rollback runs" ($rollback.ExitCode -eq 0) "exit $($rollback.ExitCode)"
-            $reg = Get-ItemProperty $InternetSettingsPath
-            Add-Check "rollback disables system proxy" ($reg.ProxyEnable -eq 0)
-            Add-Check "rollback clears user env" ([string]::IsNullOrEmpty([Environment]::GetEnvironmentVariable("HTTP_PROXY", "User")))
-            $wslConfigAfterRollback = if (Test-Path "$env:USERPROFILE\.wslconfig") { Get-Content "$env:USERPROFILE\.wslconfig" -Raw } else { "" }
-            Add-Check "rollback removes .wslconfig management markers" (-not $wslConfigAfterRollback.Contains("# dev-proxy managed:"))
+            $rollbackStarted = $false
+            $restoreSucceeded = $false
+            try {
+                # Mark this before invoking the child because it may partially
+                # change state before an invocation or output-handling error.
+                $rollbackStarted = $true
+                $rollback = Invoke-DevProxy @("-Disable", "-NonInteractive")
+                Add-Check "rollback runs" ($rollback.ExitCode -eq 0) "exit $($rollback.ExitCode)"
+                $reg = Get-ItemProperty $InternetSettingsPath
+                Add-Check "rollback disables system proxy" ($reg.ProxyEnable -eq 0)
+                Add-Check "rollback clears user env" ([string]::IsNullOrEmpty([Environment]::GetEnvironmentVariable("HTTP_PROXY", "User")))
+                $wslConfigAfterRollback = if (Test-Path "$env:USERPROFILE\.wslconfig") { Get-Content "$env:USERPROFILE\.wslconfig" -Raw } else { "" }
+                Add-Check "rollback removes .wslconfig management markers" (-not $wslConfigAfterRollback.Contains("# dev-proxy managed:"))
 
-            $again = Invoke-DevProxy @("-Disable", "-NonInteractive")
-            Add-Check "second rollback is a no-op" ([bool]($again.Text -match "already disabled"))
-            $profileBackupsAfter = [int](Invoke-WslScript $Distro 'ls "$HOME"/.profile.dev-proxy.bak.* 2>/dev/null | wc -l' | Select-Object -Last 1)
-            Add-Check "no extra ~/.profile backup" ($profileBackupsAfter -eq ($profileBackupsBefore + 1)) "$profileBackupsBefore -> $profileBackupsAfter"
+                $again = Invoke-DevProxy @("-Disable", "-NonInteractive")
+                Add-Check "second rollback is a no-op" ([bool]($again.Text -match "already disabled"))
+                $profileBackupsAfter = [int](Invoke-WslScript $Distro 'ls "$HOME"/.profile.dev-proxy.bak.* 2>/dev/null | wc -l' | Select-Object -Last 1)
+                Add-Check "no extra ~/.profile backup" ($profileBackupsAfter -eq ($profileBackupsBefore + 1)) "$profileBackupsBefore -> $profileBackupsAfter"
 
-            $restore = Invoke-DevProxy $applyArgs
-            Add-Check "restore succeeds" ($restore.ExitCode -eq 0) "exit $($restore.ExitCode)"
-            $wslConfigAfterRestore = if (Test-Path "$env:USERPROFILE\.wslconfig") { Get-Content "$env:USERPROFILE\.wslconfig" -Raw } else { "" }
-            Add-Check "restore enables mirrored networking" ($wslConfigAfterRestore -match '(?im)^networkingMode=mirrored\s*$')
-            Add-Check "restore enables WSL DNS tunneling" ($wslConfigAfterRestore -match '(?im)^dnsTunneling=true\s*$')
-            Add-Check "restore disables WSL autoProxy" ($wslConfigAfterRestore -match '(?im)^autoProxy=false\s*$')
-            $activeLines = [int](Invoke-WslScript $Distro 'grep -cxF ''. "$HOME/.config/dev-proxy/proxy-env.sh"'' "$HOME/.profile"' | Select-Object -Last 1)
-            Add-Check "profile has exactly one active source line" ($activeLines -eq 1) "found $activeLines"
+                $restore = Invoke-DevProxy $applyArgs
+                $restoreSucceeded = ($restore.ExitCode -eq 0)
+                Add-Check "restore succeeds" $restoreSucceeded "exit $($restore.ExitCode)"
+                if ($restoreSucceeded) {
+                    $wslConfigAfterRestore = if (Test-Path "$env:USERPROFILE\.wslconfig") { Get-Content "$env:USERPROFILE\.wslconfig" -Raw } else { "" }
+                    if ($expectMirrored) {
+                        Add-Check "restore enables mirrored networking" ($wslConfigAfterRestore -match '(?im)^networkingMode=mirrored\s*$')
+                        Add-Check "restore enables WSL DNS tunneling" ($wslConfigAfterRestore -match '(?im)^dnsTunneling=true\s*$')
+                    } else {
+                        Add-Check "restore leaves mirrored networking disabled" ($wslConfigAfterRestore -notmatch '(?im)^networkingMode=mirrored\s*$')
+                    }
+                    Add-Check "restore disables WSL autoProxy" ($wslConfigAfterRestore -match '(?im)^autoProxy=false\s*$')
+                    $activeLines = [int](Invoke-WslScript $Distro 'grep -cxF ''. "$HOME/.config/dev-proxy/proxy-env.sh"'' "$HOME/.profile"' | Select-Object -Last 1)
+                    Add-Check "profile has exactly one active source line" ($activeLines -eq 1) "found $activeLines"
+                }
+            } finally {
+                if ($rollbackStarted -and !$restoreSucceeded) {
+                    try {
+                        $recovery = Invoke-DevProxy $applyArgs
+                        $restoreSucceeded = ($recovery.ExitCode -eq 0)
+                        Add-Check "recovery restore succeeds" $restoreSucceeded "exit $($recovery.ExitCode)"
+                    } catch {
+                        Add-Check "recovery restore succeeds" $false $_.Exception.Message
+                    }
+                }
+            }
         }
     }
 }

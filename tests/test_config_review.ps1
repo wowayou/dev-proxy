@@ -154,6 +154,23 @@ try {
     }, $true).Extent.Text
     Assert-Contains $proxyOwnershipFunction 'restored any tool-managed mirrored settings and set autoProxy=false' 'option 4 success message describes both changes'
 
+    $validationTokens = $null
+    $validationParseErrors = $null
+    $validationAst = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $repo 'run-validation.ps1'), [ref]$validationTokens, [ref]$validationParseErrors)
+    Assert-True (!$validationParseErrors) 'run-validation.ps1 parse succeeds'
+    $recoveryTry = $validationAst.Find({
+        param($node)
+        $node -is [Management.Automation.Language.TryStatementAst] -and
+            $node.Finally -and
+            $node.Finally.Extent.Text.Contains('recovery restore succeeds')
+    }, $true)
+    Assert-True ($null -ne $recoveryTry) 'full validation rollback has a recovery finally block'
+    Assert-Contains $recoveryTry.Body.Extent.Text '$rollbackStarted = $true' 'recovery guard is armed before rollback starts'
+    Assert-Contains $recoveryTry.Finally.Extent.Text '$rollbackStarted -and !$restoreSucceeded' 'recovery retries only when rollback may have changed state'
+    $validationText = $validationAst.Extent.Text
+    Assert-True ([bool]($validationText -match '(?s)if \(\$expectMirrored\) \{\s*Add-Check "restore enables mirrored networking".*?Add-Check "restore enables WSL DNS tunneling"')) 'mirrored restore assertions are conditional on the saved preference'
+    Assert-Contains $validationText 'restore leaves mirrored networking disabled' 'NAT restore checks that mirrored networking stays disabled'
+
     # A zero transport exit without the rollback's own completion marker must
     # never produce an OK result.
     $script:CapturedOk = @()
