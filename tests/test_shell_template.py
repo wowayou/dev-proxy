@@ -59,6 +59,7 @@ class ShellTemplateTests(unittest.TestCase):
         source = source.replace("__PROXY_PORT__", str(self.target_port))
         source = source.replace("__INTEROP_PORT__", str(self.port))
         source = source.replace("__INTEROP_FALLBACK__", "true")
+        source = source.replace("__INTEROP_AVAILABLE__", "true")
         source = source.replace("__NO_PROXY__", "localhost,127.0.0.1,.local")
         source = source.replace("__MIRRORED_PROXY_HOSTS__", "127.0.0.1")
         source = source.replace("__INSTANCE_TOKEN__", self.token)
@@ -221,6 +222,13 @@ class ShellTemplateTests(unittest.TestCase):
         result = self._source(f"cp '{replacement}' '{self.profile}'; proxy_refresh; printf '%s,%s\\n' \"$DEV_PROXY_INTEROP_PORT\" \"$DEV_PROXY_PORT\"")
         self.assertEqual(0, result.returncode)
         self.assertIn(f"{new_port},{new_port}", result.stdout)
+
+    def test_proxy_refresh_preserves_resolution_failure_status(self):
+        self._write_executable("wslinfo", "#!/bin/sh\nexit 127\n")
+        self._write_executable("ip", "#!/bin/sh\nexit 0\n")
+        result = self._source("proxy_refresh; printf 'REFRESH_RC=%s\\n' \"$?\"")
+        self.assertEqual(0, result.returncode)
+        self.assertIn("REFRESH_RC=1", result.stdout)
 
     def test_old_generation_listener_is_not_claimed_by_new_token(self):
         old_token = "b" * 64

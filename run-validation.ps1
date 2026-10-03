@@ -57,8 +57,17 @@ function Invoke-DevProxy([string[]]$Arguments) {
     # dev-proxy.ps1 prints through [Console]::Write, which bypasses the
     # PowerShell output stream. Running it as a child process puts that console
     # output into a pipe this script can actually read.
-    $output = & $script:HostExe -NoProfile -File $ToolPath @Arguments 2>&1 | ForEach-Object { "$_" }
-    $code = $LASTEXITCODE
+    $oldPreference = $ErrorActionPreference
+    try {
+        # Windows PowerShell 5.1 promotes native stderr merged with 2>&1 to
+        # ErrorRecord objects. Keep expected child diagnostics from aborting
+        # the validation before rollback/restore can finish.
+        $ErrorActionPreference = "Continue"
+        $output = & $script:HostExe -NoProfile -File $ToolPath @Arguments 2>&1 | ForEach-Object { "$_" }
+        $code = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $oldPreference
+    }
     return [pscustomobject]@{
         ExitCode = $code
         Output = @($output)
@@ -73,7 +82,13 @@ function Invoke-WslScript([string]$Distro, [string]$Script) {
     $normalized = ($Script -replace "`r`n", "`n") -replace "`r", "`n"
     $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($normalized))
     $runner = "printf '%s' '$encoded' | base64 -d | timeout 45 bash -l"
-    $raw = & wsl.exe -d $Distro -- bash -c $runner 2>&1
+    $oldPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        $raw = & wsl.exe -d $Distro -- bash -c $runner 2>&1
+    } finally {
+        $ErrorActionPreference = $oldPreference
+    }
     $lines = @()
     foreach ($item in $raw) {
         $text = ("$item" -replace "`0", "").Trim()
@@ -121,12 +136,27 @@ Write-Host "Mode:  $(if ($Full) { 'full (changes real state)' } else { 'read-onl
 
 Write-Section "1. Parse and syntax"
 
-foreach ($file in (Get-ChildItem $ScriptRoot -Filter *.ps1 | Sort-Object Name)) {
+foreach ($file in (Get-ChildItem $ScriptRoot -Filter *.ps1 -Recurse | Sort-Object FullName)) {
     $tokens = $null
     $errors = $null
     [System.Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$tokens, [ref]$errors) | Out-Null
-    Add-Check "parses: $($file.Name)" (-not $errors) ($errors | Select-Object -First 1)
+    $relativeName = $file.FullName.Substring($ScriptRoot.Length).TrimStart('\')
+    Add-Check "parses: $relativeName" (-not $errors) ($errors | Select-Object -First 1)
 }
+
+$nonAsciiToolBytes = @([IO.File]::ReadAllBytes($ToolPath) | Where-Object { $_ -gt 0x7F })
+Add-Check "dev-proxy.ps1 stays ASCII-safe for Windows PowerShell 5.1" ($nonAsciiToolBytes.Count -eq 0) "$($nonAsciiToolBytes.Count) non-ASCII byte(s)"
+
+$configReviewPath = Join-Path $ScriptRoot "tests\test_config_review.ps1"
+$oldPreference = $ErrorActionPreference
+try {
+    $ErrorActionPreference = "Continue"
+    $configReviewOutput = & $script:HostExe -NoProfile -File $configReviewPath 2>&1 | ForEach-Object { "$_" }
+    $configReviewExitCode = $LASTEXITCODE
+} finally {
+    $ErrorActionPreference = $oldPreference
+}
+Add-Check "isolated PowerShell config review" ($configReviewExitCode -eq 0 -and $configReviewOutput -contains "PASS test_config_review.ps1") "exit $configReviewExitCode"
 
 try {
     Get-Content $ExamplePath -Raw | ConvertFrom-Json | Out-Null
@@ -186,14 +216,28 @@ if ($hasWsl) {
     # file content is always available on this side.
     $templateText = ((Get-Content $TemplatePath -Raw) -replace "`r`n", "`n") -replace "`r", "`n"
     $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($templateText))
-    $syntax = & wsl.exe -- bash -c "printf '%s' '$encoded' | base64 -d | bash -n" 2>&1
-    Add-Check "bash -n templates/wsl-proxy-env.sh" ($LASTEXITCODE -eq 0) (@($syntax | ForEach-Object { "$_" }) -join " ")
+    $oldPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        $syntax = & wsl.exe -- bash -c "printf '%s' '$encoded' | base64 -d | bash -n" 2>&1
+        $syntaxExitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $oldPreference
+    }
+    Add-Check "bash -n templates/wsl-proxy-env.sh" ($syntaxExitCode -eq 0) (@($syntax | ForEach-Object { "$_" }) -join " ")
 
     $interopText = Get-Content $InteropTemplatePath -Raw
     $interopText = $interopText.Replace("__INTEROP_PORT__", "20180").Replace("__WINDOWS_RELAY_ENCODED__", "QQ==")
     $encodedInterop = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($interopText))
-    $pythonSyntax = & wsl.exe -- bash -c "printf '%s' '$encodedInterop' | base64 -d | python3 -c 'import ast,sys; ast.parse(sys.stdin.read())'" 2>&1
-    Add-Check "parses: templates/wsl-interop-proxy.py" ($LASTEXITCODE -eq 0) (@($pythonSyntax | ForEach-Object { "$_" }) -join " ")
+    $oldPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        $pythonSyntax = & wsl.exe -- bash -c "printf '%s' '$encodedInterop' | base64 -d | python3 -c 'import ast,sys; ast.parse(sys.stdin.read())'" 2>&1
+        $pythonExitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $oldPreference
+    }
+    Add-Check "parses: templates/wsl-interop-proxy.py" ($pythonExitCode -eq 0) (@($pythonSyntax | ForEach-Object { "$_" }) -join " ")
 } else {
     Add-Result -Name "WSL template syntax" -Status "SKIP" -Detail "wsl.exe not found"
 }
@@ -351,7 +395,7 @@ if (-not $Full) {
             Add-Check "restore enables mirrored networking" ($wslConfigAfterRestore -match '(?im)^networkingMode=mirrored\s*$')
             Add-Check "restore enables WSL DNS tunneling" ($wslConfigAfterRestore -match '(?im)^dnsTunneling=true\s*$')
             Add-Check "restore disables WSL autoProxy" ($wslConfigAfterRestore -match '(?im)^autoProxy=false\s*$')
-            $activeLines = [int](Invoke-WslScript $Distro 'grep -cxF ''source "$HOME/.config/dev-proxy/proxy-env.sh"'' "$HOME/.profile"' | Select-Object -Last 1)
+            $activeLines = [int](Invoke-WslScript $Distro 'grep -cxF ''. "$HOME/.config/dev-proxy/proxy-env.sh"'' "$HOME/.profile"' | Select-Object -Last 1)
             Add-Check "profile has exactly one active source line" ($activeLines -eq 1) "found $activeLines"
         }
     }

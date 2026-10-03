@@ -44,7 +44,10 @@ try {
     # Some constrained hosts forbid changing this. Verification still runs.
 }
 
+$script:OriginalConsoleOutputEncoding = $null
+$script:OriginalPipelineOutputEncoding = $OutputEncoding
 try {
+    $script:OriginalConsoleOutputEncoding = [Console]::OutputEncoding
     [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
     $OutputEncoding = [Console]::OutputEncoding
 } catch {
@@ -371,8 +374,10 @@ function Show-WinHttpProxy {
 }
 
 function Test-WslLocalhostProxyNoise([string]$Text) {
-    if ($Text -match "localhost.*WSL|localhost.*proxy|localhost 代理|NAT 模式|WSL0NAT") { return $true }
-    if ($Text -match "localhost" -and $Text -match "�|Km0R|N/ec|Nt0|NtM") { return $true }
+    # Keep this script ASCII so Windows PowerShell 5.1 cannot decode these
+    # regex alternatives through the active ANSI code page and swallow a '|'.
+    if ($Text -match "localhost.*WSL|localhost.*proxy|localhost \u4EE3\u7406|NAT \u6A21\u5F0F|WSL0NAT") { return $true }
+    if ($Text -match "localhost" -and $Text -match "\uFFFD|Km0R|N/ec|Nt0|NtM") { return $true }
     return $false
 }
 
@@ -787,6 +792,35 @@ function Configure-WslMirrored {
     Write-Warn "Run 'wsl --shutdown' after saving work in WSL, then reopen WSL."
 }
 
+function Configure-WslProxyOwnership {
+    $path = Join-Path $env:USERPROFILE ".wslconfig"
+    $existing = @()
+    if (Test-Path $path) {
+        $existing = @([IO.File]::ReadAllLines($path, [Text.Encoding]::UTF8))
+    }
+    # The generated shell profile is the single owner of proxy variables in
+    # both mirrored and NAT modes. Manage only autoProxy when the user does not
+    # want this tool to select mirrored networking.
+    $lines = Set-ManagedIniValue $existing "wsl2" "autoProxy" "false"
+    if (($existing -join "`n") -eq (@($lines) -join "`n")) {
+        Write-Ok "$path already disables WSL autoProxy for the dev-proxy shell profile"
+        return
+    }
+    if ($DryRun) {
+        Write-Info "Dry-run: would update $path with autoProxy=false"
+        return
+    }
+    Write-Info "Disabling WSL autoProxy so the generated shell profile remains the only proxy-variable owner."
+    if (Test-Path $path) {
+        $backup = "$path.bak.$(Get-Date -Format yyyyMMddHHmmssfff)"
+        Copy-Item $path $backup -Force
+        Write-Info "Backed up existing .wslconfig to $backup"
+    }
+    [IO.File]::WriteAllLines($path, @($lines), (New-Object Text.UTF8Encoding($false)))
+    Write-Ok "Updated $path with autoProxy=false"
+    Write-Warn "Run 'wsl --shutdown' after saving work in WSL, then reopen WSL."
+}
+
 function Get-WslMirrorableWindowsHosts {
     $hosts = New-Object System.Collections.Generic.List[string]
     try {
@@ -842,23 +876,6 @@ function Install-WslProxyEnv($Config) {
     if (!(Test-Path $TemplatePath) -or !(Test-Path $InteropTemplatePath)) {
         throw "Missing WSL template: $TemplatePath or $InteropTemplatePath"
     }
-    if (!$Config.enableWslMirrored) {
-        $wslConfigPath = Join-Path $env:USERPROFILE ".wslconfig"
-        $autoProxyExplicitFalse = $false
-        if (Test-Path $wslConfigPath) {
-            $wslLines = @([IO.File]::ReadAllLines($wslConfigPath, [Text.Encoding]::UTF8))
-            $wslBounds = Get-IniSectionBounds $wslLines "wsl2"
-            if ($wslBounds.Start -ge 0) {
-                for ($i = $wslBounds.Start + 1; $i -lt $wslBounds.End; $i++) {
-                    if ($wslLines[$i] -match '^\s*autoProxy\s*=\s*false\s*$') { $autoProxyExplicitFalse = $true; break }
-                }
-            }
-        }
-        if (-not $autoProxyExplicitFalse) {
-            Write-Fail "WSL autoProxy is not explicitly false and conflicts with the generated proxy profile while mirrored networking is disabled; set [wsl2] autoProxy=false or enable mirrored mode before installing."
-            return
-        }
-    }
     $content = Get-Content $TemplatePath -Raw
     $content = $content.Replace("__PROXY_SCHEME__", [string]$Config.proxyScheme)
     $content = $content.Replace("__PROXY_HOST__", (ConvertTo-BashSingleQuotedContent ([string]$Config.proxyHost)))
@@ -871,7 +888,10 @@ function Install-WslProxyEnv($Config) {
     $interopToken = Get-InteropIdentityToken $Config
     $content = $content.Replace("__INSTANCE_TOKEN__", $interopToken)
 
-    $relayHost = ([string]$Config.proxyHost).Replace("'", "''")
+    # PowerShell recognizes several Unicode single-quote characters as string
+    # delimiters. Use its code generator rather than escaping ASCII apostrophes
+    # only, otherwise a hand-edited host value could alter the relay script.
+    $relayHost = [Management.Automation.Language.CodeGeneration]::EscapeSingleQuotedStringContent([string]$Config.proxyHost)
     $windowsRelay = @"
 `$ErrorActionPreference = 'Stop'
 `$client = New-Object Net.Sockets.TcpClient
@@ -931,18 +951,31 @@ if ! command -v flock >/dev/null 2>&1; then
 fi
 exec 9>"$HOME/.config/dev-proxy/interop-__INTEROP_PORT__.lock"
 flock -x 9
-# Preflight the IPv6 relay bind before replacing either generated file or the
-# profile. An existing process is accepted only when its private state proves
-# the same PID, /proc starttime, script path, and generation token.
-if [ "__INTEROP_FALLBACK__" = "true" ] && ! python3 - "__INTEROP_PORT__" "$HOME/.config/dev-proxy/interop-__INTEROP_PORT__-__INSTANCE_TOKEN__" "__INSTANCE_TOKEN__" <<'PY'
-import os, socket, sys
+# Preflight the optional IPv6 relay before replacing generated files. Missing
+# prerequisites disable only the fallback for this installed profile; a real
+# port collision still aborts so traffic is never handed to a foreign process.
+interop_available=false
+if [ "__INTEROP_FALLBACK__" = "true" ]; then
+  if ! command -v python3 >/dev/null 2>&1; then
+    printf 'install-warning: WSL interop fallback is unavailable because python3 is not installed; installing direct/NAT paths only\n' >&2
+  elif ! command -v powershell.exe >/dev/null 2>&1 \
+    && ! command -v pwsh.exe >/dev/null 2>&1 \
+    && [ ! -x /mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe ]; then
+    printf 'install-warning: WSL interop fallback is unavailable because Windows PowerShell interop is not accessible; installing direct/NAT paths only\n' >&2
+  else
+    set +e
+    python3 - "__INTEROP_PORT__" "$HOME/.config/dev-proxy/interop-__INTEROP_PORT__-__INSTANCE_TOKEN__" "__INSTANCE_TOKEN__" <<'PY'
+import errno, os, socket, sys
 port = int(sys.argv[1])
 state = sys.argv[2]
 token = sys.argv[3]
 try:
     with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as probe:
         probe.bind(("::1", port))
-except OSError:
+except OSError as bind_error:
+    if bind_error.errno != errno.EADDRINUSE:
+        print("install-warning: WSL interop fallback cannot bind IPv6 loopback (%s); installing direct/NAT paths only" % bind_error, file=sys.stderr)
+        raise SystemExit(2)
     try:
         pid = open(os.path.join(state, "pid"), encoding="ascii").read().strip()
         start = open(os.path.join(state, "starttime"), encoding="ascii").read().strip()
@@ -956,31 +989,40 @@ except OSError:
         print("install-error: relay port is occupied by an unknown or prior generation (%s)" % exc, file=sys.stderr)
         raise SystemExit(1)
 PY
-then
-  exit 1
+    relay_preflight_rc=$?
+    set -e
+    case "$relay_preflight_rc" in
+      0) interop_available=true ;;
+      2) interop_available=false ;;
+      *) exit 1 ;;
+    esac
+  fi
 fi
 tmp_env="$(mktemp "$HOME/.config/dev-proxy/proxy-env.sh.tmp.XXXXXX")"
 tmp_interop="$(mktemp "$HOME/.config/dev-proxy/interop-proxy.py.tmp.XXXXXX")"
 trap 'rm -f "$tmp_env" "$tmp_interop"' EXIT
 printf '%s' '__CONTENT_BASE64__' | base64 -d > "$tmp_env"
 printf '%s' '__INTEROP_BASE64__' | base64 -d > "$tmp_interop"
+sed -i "s/__INTEROP_AVAILABLE__/$interop_available/g" "$tmp_env"
 chmod 600 "$tmp_env" "$tmp_interop"
 mv -f "$tmp_env" "$HOME/.config/dev-proxy/proxy-env.sh"
 mv -f "$tmp_interop" "$HOME/.config/dev-proxy/interop-proxy.py"
 trap - EXIT
 touch "$HOME/.profile"
-SOURCE_LINE='source "$HOME/.config/dev-proxy/proxy-env.sh"'
+SOURCE_LINE='. "$HOME/.config/dev-proxy/proxy-env.sh"'
+LEGACY_SOURCE_LINE='source "$HOME/.config/dev-proxy/proxy-env.sh"'
 DISABLED_LINE="# disabled by dev-proxy: $SOURCE_LINE"
+LEGACY_DISABLED_LINE="# disabled by dev-proxy: $LEGACY_SOURCE_LINE"
 
 # Re-enable only the exact line this tool disabled, collapse duplicate copies,
 # and make one backup immediately before an actual profile replacement.
 tmp_profile="$(mktemp "$HOME/.profile.dev-proxy.tmp.XXXXXX")"
 found=0
 while IFS= read -r line || [ -n "$line" ]; do
-  if [ "$line" = "$DISABLED_LINE" ]; then
+  if [ "$line" = "$DISABLED_LINE" ] || [ "$line" = "$LEGACY_DISABLED_LINE" ]; then
     if [ "$found" -eq 0 ]; then printf '%s\n' "$SOURCE_LINE"; found=1; fi
-  elif [ "$line" = "$SOURCE_LINE" ]; then
-    if [ "$found" -eq 0 ]; then printf '%s\n' "$line"; found=1; fi
+  elif [ "$line" = "$SOURCE_LINE" ] || [ "$line" = "$LEGACY_SOURCE_LINE" ]; then
+    if [ "$found" -eq 0 ]; then printf '%s\n' "$SOURCE_LINE"; found=1; fi
   else
     printf '%s\n' "$line"
   fi
@@ -991,11 +1033,24 @@ fi
 if ! cmp -s "$tmp_profile" "$HOME/.profile"; then
   profile_backup="$(mktemp "$HOME/.profile.dev-proxy.bak.XXXXXX")"
   cp "$HOME/.profile" "$profile_backup"
-  mv -f "$tmp_profile" "$HOME/.profile"
+  if [ -L "$HOME/.profile" ]; then
+    cat "$tmp_profile" > "$HOME/.profile"
+    rm -f "$tmp_profile"
+  else
+    mv -f "$tmp_profile" "$HOME/.profile"
+  fi
 else
   rm -f "$tmp_profile"
 fi
 printf 'installed:%s\n' "$HOME/.config/dev-proxy/proxy-env.sh"
+for login_profile in "$HOME/.bash_profile" "$HOME/.bash_login"; do
+  [ -f "$login_profile" ] || continue
+  if ! grep -Ev '^[[:space:]]*#' "$login_profile" \
+    | grep -Eq '(^|[;[:space:]])(\.|source)[[:space:]]+"?(\$HOME/|~/)\.profile"?([;[:space:]]|$)'; then
+    printf 'install-warning: %s exists and does not directly load ~/.profile; Bash login shells may skip the dev-proxy hook\n' "$login_profile" >&2
+  fi
+  break
+done
 '@
     $installCmd = $installCmd.Replace("__CONTENT_BASE64__", $contentBase64)
     $installCmd = $installCmd.Replace("__INTEROP_BASE64__", $interopBase64)
@@ -1010,7 +1065,7 @@ printf 'installed:%s\n' "$HOME/.config/dev-proxy/proxy-env.sh"
         return
     }
     Write-Ok "Installed WSL proxy environment for $($Config.distro)"
-    Write-Tip "Open a new WSL shell, or run: source ~/.profile"
+    Write-Tip "Open a new WSL shell, or run: . ~/.profile"
 }
 
 function Disable-WslProxyEnv($Config) {
@@ -1024,7 +1079,8 @@ function Disable-WslProxyEnv($Config) {
     }
     $cmd = @'
 set -e
-SOURCE_LINE='source "$HOME/.config/dev-proxy/proxy-env.sh"'
+SOURCE_LINE='. "$HOME/.config/dev-proxy/proxy-env.sh"'
+LEGACY_SOURCE_LINE='source "$HOME/.config/dev-proxy/proxy-env.sh"'
 # Enumerate every private generation state.  Rollback must stop an installed
 # older target even when config.json has since changed; the legacy fixed PID
 # file is intentionally ignored because it has no generation identity.
@@ -1073,7 +1129,8 @@ done
 if [ -f "$BASE/interop-proxy.pid" ]; then
   printf 'legacy-relay-preserved\n'
 fi
-if [ ! -f "$HOME/.profile" ] || ! grep -qxF "$SOURCE_LINE" "$HOME/.profile"; then
+if [ ! -f "$HOME/.profile" ] \
+  || { ! grep -qxF "$SOURCE_LINE" "$HOME/.profile" && ! grep -qxF "$LEGACY_SOURCE_LINE" "$HOME/.profile"; }; then
   # Nothing active to disable, so do not leave another backup behind.
   printf 'disable-complete:already-disabled\n'
   exit 0
@@ -1081,8 +1138,13 @@ fi
 profile_backup="$(mktemp "$HOME/.profile.dev-proxy.bak.XXXXXX")"
 cp "$HOME/.profile" "$profile_backup"
 tmp="$(mktemp)"
-awk '{ if ($0 == "source \"$HOME/.config/dev-proxy/proxy-env.sh\"") print "# disabled by dev-proxy: " $0; else print $0 }' "$HOME/.profile" > "$tmp"
-mv "$tmp" "$HOME/.profile"
+awk '{ if ($0 == ". \"$HOME/.config/dev-proxy/proxy-env.sh\"" || $0 == "source \"$HOME/.config/dev-proxy/proxy-env.sh\"") print "# disabled by dev-proxy: " $0; else print $0 }' "$HOME/.profile" > "$tmp"
+if [ -L "$HOME/.profile" ]; then
+  cat "$tmp" > "$HOME/.profile"
+  rm -f "$tmp"
+else
+  mv "$tmp" "$HOME/.profile"
+fi
 printf 'disable-complete:disabled\n'
 '@
     $result = Invoke-WslBash -Distro $Config.distro -Command $cmd
@@ -1159,15 +1221,25 @@ function Verify-All($Config) {
         if ($reg.ProxyEnable -eq 1 -and "$($reg.ProxyServer)" -eq $expectedProxyServer) {
             Write-Ok "Windows user system proxy is enabled: $($reg.ProxyServer)"
         } else {
-            Write-Warn "Windows user system proxy does not match target. Current: enabled=$($reg.ProxyEnable), server=$($reg.ProxyServer)"
+            Write-Fail "Windows user system proxy does not match target. Current: enabled=$($reg.ProxyEnable), server=$($reg.ProxyServer)"
         }
     } catch {
-        Write-Warn "Could not read Windows proxy registry: $($_.Exception.Message)"
+        Write-Fail "Could not read Windows proxy registry: $($_.Exception.Message)"
     }
 
     Show-Progress $activity "Checking Windows user proxy environment variables" 25
-    $userProxy = [Environment]::GetEnvironmentVariable("HTTP_PROXY", "User")
-    if ($userProxy -eq $proxyUrl) { Write-Ok "User HTTP_PROXY matches target" } else { Write-Warn "User HTTP_PROXY mismatch: $userProxy" }
+    $envMismatches = @()
+    foreach ($entry in @(Get-ProxyEnvEntries $Config)) {
+        $actual = [Environment]::GetEnvironmentVariable($entry.Name, "User")
+        if ($actual -ne $entry.Value) {
+            $envMismatches += "$($entry.Name)='$actual'"
+        }
+    }
+    if ($envMismatches.Count -eq 0) {
+        Write-Ok "Windows user proxy environment variables match target"
+    } else {
+        Write-Fail "Windows user proxy environment variables do not match target: $($envMismatches -join ', ')"
+    }
 
     Show-Progress $activity "Checking proxy TCP listener" 40
     if (Test-TcpPort $Config.proxyHost $Config.proxyPort) {
@@ -1198,6 +1270,25 @@ if [ ! -f "$env_file" ]; then
   printf 'MISSING_WSL_ENV\n'
   exit 0
 fi
+
+SOURCE_LINE='. "$HOME/.config/dev-proxy/proxy-env.sh"'
+LEGACY_SOURCE_LINE='source "$HOME/.config/dev-proxy/proxy-env.sh"'
+if [ ! -f "$HOME/.profile" ] \
+  || { ! grep -qxF "$SOURCE_LINE" "$HOME/.profile" && ! grep -qxF "$LEGACY_SOURCE_LINE" "$HOME/.profile"; }; then
+  printf 'WSL_PROFILE_INACTIVE\n'
+  printf 'CHECKS_DONE\n'
+  exit 0
+fi
+for login_profile in "$HOME/.bash_profile" "$HOME/.bash_login"; do
+  [ -f "$login_profile" ] || continue
+  if ! grep -Ev '^[[:space:]]*#' "$login_profile" \
+    | grep -Eq '(^|[;[:space:]])(\.|source)[[:space:]]+"?(\$HOME/|~/)\.profile"?([;[:space:]]|$)'; then
+    printf 'WSL_PROFILE_BYPASSED path=%s\n' "$login_profile"
+    printf 'CHECKS_DONE\n'
+    exit 0
+  fi
+  break
+done
 
 # proxy_on returns non-zero when no host resolves. Keep going either way so
 # proxy_status can report what actually happened.
@@ -1315,13 +1406,18 @@ printf 'CHECKS_DONE\n'
         if ($result.Failed) {
             Write-Fail "WSL checks did not run for $($Config.distro): $(Get-WslFailureReason $result)"
         } else {
-            if ($parsed.Lines -contains "TARGET_MISMATCH" -or ($parsed.Lines -match '^TARGET_MISMATCH ')) {
-                Write-Fail "WSL proxy profile target/relay generation does not match configured target; reinstall it or use a parallel interop port."
-            } elseif (-not ($parsed.Lines -contains "TARGET_MATCH")) {
-                Write-Fail "WSL proxy profile did not report a target match; reinstall it with option 4."
-            }
-            if (-not ($parsed.Lines -contains "PROXY_PATH_MATCH")) {
-                Write-Fail "WSL HTTP proxy path does not match the resolved host/port; profile may be stale or disabled."
+            $profileUnavailable = ($parsed.Lines -contains "MISSING_WSL_ENV") -or
+                ($parsed.Lines -contains "WSL_PROFILE_INACTIVE") -or
+                [bool]($parsed.Lines -match '^WSL_PROFILE_BYPASSED ')
+            if (!$profileUnavailable) {
+                if ($parsed.Lines -contains "TARGET_MISMATCH" -or ($parsed.Lines -match '^TARGET_MISMATCH ')) {
+                    Write-Fail "WSL proxy profile target/relay generation does not match configured target; reinstall it or use a parallel interop port."
+                } elseif (-not ($parsed.Lines -contains "TARGET_MATCH")) {
+                    Write-Fail "WSL proxy profile did not report a target match; reinstall it with option 4."
+                }
+                if (-not ($parsed.Lines -contains "PROXY_PATH_MATCH")) {
+                    Write-Fail "WSL HTTP proxy path does not match the resolved host/port; profile may be stale or disabled."
+                }
             }
             foreach ($line in $parsed.Lines) {
                 if ($line -match "^FAIL_PROXY_TCP kind=([^ ]+)") {
@@ -1346,13 +1442,19 @@ printf 'CHECKS_DONE\n'
                     }
                 } elseif ($line -eq "MISSING_WSL_ENV") {
                     Write-Fail "WSL proxy profile is not installed in $($Config.distro)"
+                } elseif ($line -eq "WSL_PROFILE_INACTIVE") {
+                    Write-Fail "WSL proxy profile is installed but its ~/.profile hook is disabled or missing. Reinstall it with option 4."
+                } elseif ($line -match '^WSL_PROFILE_BYPASSED path=(.+)$') {
+                    Write-Fail "WSL Bash login profile $($Matches[1]) does not load ~/.profile, so new login shells skip the proxy hook."
                 }
             }
-            if (-not ($parsed.Lines -match '^DEV_PROXY_NETWORKING_MODE=(mirrored|nat)$')) {
-                Write-Fail "WSL proxy profile did not report a networking mode; reinstall it with option 4."
-            }
-            if (-not ($parsed.Lines -match '^(PASS|FAIL)_PROXY_TCP ')) {
-                Write-Fail "WSL TCP-layer proxy check did not produce a result."
+            if (!$profileUnavailable) {
+                if (-not ($parsed.Lines -match '^DEV_PROXY_NETWORKING_MODE=(mirrored|nat)$')) {
+                    Write-Fail "WSL proxy profile did not report a networking mode; reinstall it with option 4."
+                }
+                if (-not ($parsed.Lines -match '^(PASS|FAIL)_PROXY_TCP ')) {
+                    Write-Fail "WSL TCP-layer proxy check did not produce a result."
+                }
             }
             # Without the sentinel the script stopped partway, which must not
             # read as a clean run just because no FAIL_ marker was printed.
@@ -1468,6 +1570,8 @@ function Apply-WslProxy($Config) {
         Show-Progress $activity "Updating .wslconfig for mirrored networking" 45
         Configure-WslMirrored
     } else {
+        Show-Progress $activity "Disabling WSL autoProxy ownership conflict" 45
+        Configure-WslProxyOwnership
         Write-Warn "Mirrored networking was skipped. WSL will fall back to the Windows host IP; this only works if your proxy client accepts non-loopback connections."
     }
     Show-Progress $activity "Installing WSL shell proxy environment" 75
@@ -1526,46 +1630,54 @@ function Show-Menu($Config) {
     }
 }
 
-$config = Read-Config
-# Keep the relay generation/port in the same persisted config as the target.
-# A changed value deliberately does not stop an old relay; installation then
-# fails clearly if the old port is still occupied, enabling a parallel-port
-# rollout for new shells.
-$WslInteropPort = [int]$config.wslInteropPort
-# -Verify and -Disable do not change the target, so they must not write one
-# either; otherwise a throwaway -ProxyPort would be saved to config.json.
-if (!$Verify -and !$Disable) { Save-Config $config }
+$exitCode = 0
+try {
+    $config = Read-Config
+    # Keep the relay generation/port in the same persisted config as the target.
+    # A changed value deliberately does not stop an old relay; installation then
+    # fails clearly if the old port is still occupied, enabling a parallel-port
+    # rollout for new shells.
+    $WslInteropPort = [int]$config.wslInteropPort
+    # -Verify and -Disable do not change the target, so they must not write one
+    # either; otherwise a throwaway -ProxyPort would be saved to config.json.
+    if (!$Verify -and !$Disable) { Save-Config $config }
 
-if ($Disable) {
-    Disable-All $config
-    exit ([int]($script:HadFailures))
-}
-
-if ($Verify) {
-    Verify-All $config
-    exit ([int]($script:HadFailures))
-}
-
-if ($NonInteractive) {
-    Apply-WindowsProxy $config
-    if ($config.distro) {
-        if ([bool]$config.enableWslMirrored) {
-            Configure-WslMirrored
+    if ($Disable) {
+        Disable-All $config
+    } elseif ($Verify) {
+        Verify-All $config
+    } elseif ($NonInteractive) {
+        Apply-WindowsProxy $config
+        if ($config.distro) {
+            if ([bool]$config.enableWslMirrored) {
+                Configure-WslMirrored
+            } else {
+                Configure-WslProxyOwnership
+                Write-Warn "Saved WSL mirrored preference is disabled; only autoProxy ownership is managed in .wslconfig."
+                Write-Warn "WSL NAT fallback requires your proxy client to accept non-loopback connections from the WSL vEthernet gateway."
+            }
+            Install-WslProxyEnv $config
         } else {
-            Write-Warn "Saved WSL mirrored preference is disabled; .wslconfig will not be changed."
-            Write-Warn "WSL NAT fallback requires your proxy client to accept non-loopback connections from the WSL vEthernet gateway."
+            Write-Warn "No distro selected. Re-run interactively or pass -Distro."
         }
-        Install-WslProxyEnv $config
+        if ($DryRun) {
+            Write-Info "Dry-run complete; verification skipped."
+        } else {
+            Verify-All $config
+        }
     } else {
-        Write-Warn "No distro selected. Re-run interactively or pass -Distro."
+        Show-Menu $config
     }
-    if ($DryRun) {
-        Write-Info "Dry-run complete; verification skipped."
-        exit ([int]($script:HadFailures))
+    $exitCode = [int]($script:HadFailures)
+} finally {
+    # Do not leak this script's UTF-8 console/pipeline preference into callers
+    # that dot-source it or host it in a long-lived PowerShell process.
+    try {
+        if ($null -ne $script:OriginalConsoleOutputEncoding) {
+            [Console]::OutputEncoding = $script:OriginalConsoleOutputEncoding
+        }
+        $OutputEncoding = $script:OriginalPipelineOutputEncoding
+    } catch {
     }
-    Verify-All $config
-    exit ([int]($script:HadFailures))
 }
-
-Show-Menu $config
-exit ([int]($script:HadFailures))
+exit $exitCode

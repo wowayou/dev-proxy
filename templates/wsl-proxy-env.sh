@@ -6,6 +6,7 @@ DEV_PROXY_TARGET_HOST_DEFAULT='__PROXY_HOST__'
 DEV_PROXY_TARGET_PORT='__PROXY_PORT__'
 DEV_PROXY_INTEROP_PORT='__INTEROP_PORT__'
 DEV_PROXY_INTEROP_FALLBACK='__INTEROP_FALLBACK__'
+DEV_PROXY_INTEROP_AVAILABLE='__INTEROP_AVAILABLE__'
 DEV_PROXY_INTEROP_TOKEN='__INSTANCE_TOKEN__'
 DEV_PROXY_PORT="${DEV_PROXY_TARGET_PORT}"
 DEV_PROXY_SCHEME="$DEV_PROXY_SCHEME_DEFAULT"
@@ -19,10 +20,11 @@ DEV_PROXY_MIRRORED_HOSTS="$DEV_PROXY_MIRRORED_HOSTS_DEFAULT"
 _dev_proxy_can_connect() {
   local host="$1"
   local port="$2"
+  local wait_seconds="${3:-3}"
   if command -v nc >/dev/null 2>&1; then
-    nc -z -w 3 "${host}" "${port}" >/dev/null 2>&1
+    nc -z -w "${wait_seconds}" "${host}" "${port}" >/dev/null 2>&1
   elif command -v timeout >/dev/null 2>&1; then
-    timeout 3 bash -c 'exec 3<>/dev/tcp/$1/$2' _ "$host" "$port" >/dev/null 2>&1
+    timeout "${wait_seconds}" bash -c 'exec 3<>/dev/tcp/$1/$2' _ "$host" "$port" >/dev/null 2>&1
   else
     return 1
   fi
@@ -140,7 +142,7 @@ _dev_proxy_ensure_interop_proxy() {
   # Otherwise the descriptor would remain locked after this shell releases it.
   (
     exec {lock_fd}>&-
-    exec nohup python3 "$base/interop-proxy.py" "$token" </dev/null >"$base/interop-proxy.log" 2>&1
+    exec nohup python3 "$base/interop-proxy.py" "$token" </dev/null >"$state_dir/relay.log" 2>&1
   ) &
   pid=$!
   printf '%s\n' "${pid}" > "${pid_file}.tmp.$$" && mv -f "${pid_file}.tmp.$$" "${pid_file}"
@@ -219,7 +221,7 @@ _dev_proxy_resolve_host() {
     IFS=','
     for candidate in ${DEV_PROXY_MIRRORED_HOSTS}; do
       IFS="${old_ifs}"
-      if [ -n "${candidate}" ] && _dev_proxy_can_connect "${candidate}" "${DEV_PROXY_PORT}"; then
+      if [ -n "${candidate}" ] && _dev_proxy_can_connect "${candidate}" "${DEV_PROXY_PORT}" 1; then
         _dev_proxy_resolved_host="${candidate}"
         if [ "${candidate}" = "127.0.0.1" ]; then
           DEV_PROXY_HOST_SOURCE="mirrored-localhost"
@@ -235,7 +237,7 @@ _dev_proxy_resolve_host() {
     # Native mirrored localhost is the cheap path. Start the Linux-local
     # interop bridge only when every direct candidate failed and the persisted
     # fallback preference is enabled.
-    if [ "${DEV_PROXY_INTEROP_FALLBACK}" = "true" ]; then
+    if [ "${DEV_PROXY_INTEROP_FALLBACK}" = "true" ] && [ "${DEV_PROXY_INTEROP_AVAILABLE}" = "true" ]; then
       if _dev_proxy_ensure_interop_proxy; then
         _dev_proxy_resolved_host="::1"
         DEV_PROXY_PORT="${DEV_PROXY_INTEROP_PORT}"
@@ -246,6 +248,8 @@ _dev_proxy_resolve_host() {
       if [ -n "${_dev_proxy_interop_error:-}" ]; then
         printf 'dev-proxy: %s\n' "${_dev_proxy_interop_error}" >&2
       fi
+    elif [ "${DEV_PROXY_INTEROP_FALLBACK}" = "true" ]; then
+      printf 'dev-proxy: interop fallback is unavailable in this installed profile; reinstall after restoring Python 3 and IPv6 loopback\n' >&2
     fi
 
     # Keep the preferred address visible when it is unreachable so verification
@@ -319,14 +323,16 @@ proxy_off() {
 }
 
 proxy_refresh() {
+  local refresh_rc
   # Reload the installed file so an existing interactive shell picks up the
   # latest target/token instead of retaining an old generation in memory.
   if [ -f "$HOME/.config/dev-proxy/proxy-env.sh" ] && [ -z "${DEV_PROXY_REFRESH_RELOAD:-}" ]; then
     DEV_PROXY_REFRESH_RELOAD=1
     export DEV_PROXY_REFRESH_RELOAD
     . "$HOME/.config/dev-proxy/proxy-env.sh"
+    refresh_rc=$?
     unset DEV_PROXY_REFRESH_RELOAD
-    return $?
+    return "$refresh_rc"
   fi
   unset DEV_PROXY_HOST DEV_PROXY_HOST_SOURCE DEV_PROXY_NETWORKING_MODE _dev_proxy_resolved_host
   DEV_PROXY_PORT="${DEV_PROXY_TARGET_PORT}"
@@ -347,6 +353,7 @@ proxy_status() {
   printf 'DEV_PROXY_TARGET_SCHEME=%s\n' "${DEV_PROXY_SCHEME}"
   printf 'DEV_PROXY_INTEROP_PORT=%s\n' "${DEV_PROXY_INTEROP_PORT}"
   printf 'DEV_PROXY_INTEROP_FALLBACK=%s\n' "${DEV_PROXY_INTEROP_FALLBACK}"
+  printf 'DEV_PROXY_INTEROP_AVAILABLE=%s\n' "${DEV_PROXY_INTEROP_AVAILABLE}"
   printf 'DEV_PROXY_INTEROP_TOKEN=%s\n' "${DEV_PROXY_INTEROP_TOKEN}"
   printf 'HTTP_PROXY=%s\n' "${HTTP_PROXY:-<unset>}"
   printf 'NO_PROXY=%s\n' "${NO_PROXY:-<unset>}"
@@ -359,6 +366,10 @@ proxy_status() {
   fi
 }
 
-# Sourced from ~/.profile: a failed lookup must not leave the login shell with a
-# non-zero status. proxy_on already explains the failure on stderr.
-proxy_on || true
+# A normal login shell must remain usable when host resolution fails. During
+# proxy_refresh, however, preserve proxy_on's status for automation and callers.
+if [ -n "${DEV_PROXY_REFRESH_RELOAD:-}" ]; then
+  proxy_on
+else
+  proxy_on || true
+fi

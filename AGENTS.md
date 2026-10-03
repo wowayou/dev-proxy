@@ -42,6 +42,10 @@ backpressure cannot leak a child indefinitely; healthy idle or streaming
 connections may remain open indefinitely. NAT mode uses only the WSL
 default-route gateway, selected from `wslinfo --networking-mode` and route
 state. Python 3, Windows interop, and Linux IPv6 loopback are prerequisites.
+If Python 3 or IPv6 loopback is unavailable during installation, only the
+optional interop fallback is marked unavailable; direct mirrored and NAT
+profile paths must still install. With mirrored mode disabled, the tool manages
+only `autoProxy=false` in `.wslconfig` and must not enable mirrored networking.
 The loopback listener is a transport boundary, not user authentication.
 
 ## Mirrored Vs NAT Reasoning
@@ -290,7 +294,8 @@ wsl.exe -d Ubuntu-24.04 -- bash -lc "grep -n dev-proxy ~/.profile"
 ```
 
 `ProxyEnable` is `0`, the user variable is empty, and the profile source line is
-commented out rather than deleted. Running rollback twice must report
+commented out rather than deleted. The canonical hook uses POSIX dot syntax:
+`. "$HOME/.config/dev-proxy/proxy-env.sh"`. Running rollback twice must report
 `already disabled` and add no second `.profile.dev-proxy.bak.*` file, and a
 later install must re-enable that line rather than append a duplicate. Only
 lines this tool commented out are recognized; a source line disabled by hand

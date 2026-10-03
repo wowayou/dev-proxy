@@ -35,7 +35,7 @@ WSL 中继承 proxy-env.sh 环境的应用
 ## 能力边界
 
 - 这是供本机开发应用使用的 HTTP/HTTPS 代理入口，不是 VPN，也不是全系统透明代理。不自动覆盖 UDP、QUIC、ICMP、容器网络、独立 systemd 服务、其他用户或未继承 shell 环境的程序。
-- proxy_off 只清除当前 shell 的环境，不能修改已经启动的程序。恢复和切换目标通常需要新 shell 或 `source ~/.profile`；`proxy_refresh` 只适用于当前 shell 已加载兼容的新 profile 函数。
+- proxy_off 只清除当前 shell 的环境，不能修改已经启动的程序。恢复和切换目标通常需要新 shell 或 `. ~/.profile`；`proxy_refresh` 只适用于当前 shell 已加载兼容的新 profile 函数。
 - 路径选择发生在加载 profile 或执行 `proxy_refresh` 时，不是运行中单个请求失败后的自动切换重试。
 - 使用互操作转发需要 WSL 能运行 Windows 程序、Python、IPv6 回环和现有 Windows 代理可用。每个活动连接启动 Windows 进程有额外成本，不适合高并发服务器负载。
 - 401/403/404 证明能收到 HTTP 响应，不证明 API 凭证、额度、模型权限或所有业务请求成功。
@@ -160,8 +160,49 @@ Microsoft 文档说明 mirrored 支持从 WSL 访问 Windows 的 127.0.0.1，不
 最新工作区未部署到真实 profile，未停止或重配现有 relay、sing-box 或 WSL。
 整机重启、睡眠恢复、真实 NAT 切换、真实全局回滚和长期 soak 仍保持未验收。
 
+## FIN 数据完整性与验证语义复核（2026-10-03）
+
+后续审查确认，客户端发送 FIN 时，可取消写入路径把正常半关闭误判为断连；当
+Windows 子进程输入管道正处于背压状态时，已经从 TCP 读取但尚未写完的尾部会被
+丢弃。修复后，上传线程在 FIN 上停止轮询客户端读端并继续排空当前数据，只把
+`POLLERR`、子进程退出、显式取消或连续 10 秒无写入进展作为失败。客户端 EOF 后
+3 秒响应排空仍是明确的资源回收上限，未冒充为无限慢响应支持。
+
+同轮修复还收紧了配置与验证语义：
+
+- 关闭 mirrored 时只管理全局 `autoProxy=false`，不启用 mirrored 或 DNS tunneling，
+  并继续安装所选发行版的 shell profile。
+- Python 3、Windows 进程互操作或 IPv6 回环不可用时，安装记录
+  `DEV_PROXY_INTEROP_AVAILABLE=false` 并保留直接 mirrored/NAT 路径；未知进程或旧
+  generation 占用 relay 端口仍是硬失败。
+- Windows system proxy、用户级代理变量或 WSL profile hook 不匹配均计为验证失败。
+  禁用后的验证不会直接加载生成文件，因此不会重启刚停止的 relay。
+- profile hook 改为 POSIX dot 语法并兼容迁移旧 `source` 行；安装与回滚保留
+  symlink，检测到 Bash login profile 绕过 `~/.profile` 时明确告警/失败。
+- PowerShell relay 使用语言服务的单引号转义，Windows PowerShell 5.1 的本地化
+  噪声正则保持 ASCII；`proxy_refresh` 保留失败状态，relay 日志按 generation
+  隔离，直接候选探测上限缩短为 1 秒。
+
+实际完成的隔离验证：
+
+- Windows PowerShell 5.1 只读维护套件：20 passed、0 failed；包含所有 PowerShell
+  文件解析、配置夹具、JSON/BOM、模板语法和 dry-run。
+- WSL runtime 与 shell：29 项中 28 passed、1 个显式真实 Windows case skipped；
+  大载荷 FIN 完整性用例另重复 5 次，5 次均通过。
+- 显式真实 Windows relay case 通过；FIN/RST 子进程 PID 41716、32052 均回收，
+  Linux relay 回到 1 个线程、4 个文件描述符。
+- PowerShell 5.1 的隔离安装/禁用/验证夹具、WSL 载荷传输夹具通过；覆盖 symlink
+  保留、禁用后不重启 relay、缺少 IPv6 fallback 能力仍安装。
+- 动态 `[::1]` 临时 relay 集成测试经 `mirrored-interop` 到 Anthropic 返回 HTTP
+  404；测试自行清理临时 HOME 与 relay。
+
+未运行会修改真实全局状态的 `run-validation.ps1 -Full`，也未重启 WSL、部署到
+真实 profile、停止现有 relay 或改动代理客户端。整机重启、睡眠恢复、真实 NAT
+切换、真实全局回滚和长期 soak 仍未验收。
+
 ## 当前结论
 
-两项已知根因均已修复并通过隔离反例、真实 Windows 子进程回收和临时端到端
-连通性验证。本次代码级可靠性验收通过，可进入提交和推送阶段；是否部署到真实
-profile 应作为单独维护动作处理，不能据此声称整机生命周期和长期稳定性已通过。
+当前已知的阻塞写入、FIN 尾部丢失、命令确认、禁用后验证误报及安装前检分类
+问题均已修复，并通过隔离反例、真实 Windows 子进程回收和临时端到端连通性
+验证。本次代码级可靠性验收通过；是否部署到真实 profile 应作为单独维护动作
+处理，不能据此声称整机生命周期和长期稳定性已通过。

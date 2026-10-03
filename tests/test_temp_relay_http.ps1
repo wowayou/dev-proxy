@@ -19,17 +19,21 @@ foreach ($f in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Lan
 }
 
 $script:FixtureHome = "/tmp/dev-proxy-temp-relay-$([guid]::NewGuid().ToString('N'))"
-$script:CommandFileWindows = Join-Path $repo ".tmp-temp-relay-$([guid]::NewGuid().ToString('N')).b64"
-$drive = $script:CommandFileWindows.Substring(0, 1).ToLowerInvariant()
-$rest = $script:CommandFileWindows.Substring(2).Replace('\', '/')
-$script:CommandFileWsl = "/mnt/$drive$rest"
 function Invoke-Fixture([string]$Command) {
     $normalized = ($Command -replace "`r`n", "`n") -replace "`r", "`n"
     $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($normalized))
-    [IO.File]::WriteAllText($script:CommandFileWindows, $encoded, (New-Object Text.UTF8Encoding($false)))
-    $runner = "export HOME='$script:FixtureHome'; base64 -d < '$script:CommandFileWsl' | bash"
-    $raw = & wsl.exe -- bash --noprofile --norc -c $runner 2>&1
-    $exitCode = $LASTEXITCODE
+    $runner = "export HOME='$script:FixtureHome'; LC_ALL=C sed '1s/^\xEF\xBB\xBF//' | tr -d '\r\n' | base64 -d | bash"
+    $oldPreference = $ErrorActionPreference
+    $oldOutputEncoding = $OutputEncoding
+    try {
+        $ErrorActionPreference = 'Continue'
+        $OutputEncoding = New-Object Text.ASCIIEncoding
+        $raw = $encoded | & wsl.exe -- bash --noprofile --norc -c $runner 2>&1
+        $exitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $oldPreference
+        $OutputEncoding = $oldOutputEncoding
+    }
     [pscustomobject]@{ ExitCode = $exitCode; Failed = ($exitCode -ne 0); TimedOut = ($exitCode -eq 124); Lines = @($raw | ForEach-Object { "$_" }) }
 }
 function Invoke-WslBash {
@@ -62,7 +66,7 @@ curl --noproxy '' -sS -o /dev/null -X GET --connect-timeout 5 --max-time 20 --pr
     $probe.Lines | ForEach-Object { Write-Output $_ }
     $http = @($probe.Lines | Where-Object { $_ -match '^ANTHROPIC_HTTP=' } | Select-Object -Last 1)
     Assert-True ($probe.Lines -contains 'DEV_PROXY_HOST_SOURCE=mirrored-interop') 'temporary probe uses the interop fallback'
-    Assert-True (!$probe.Failed -and $http -match '^ANTHROPIC_HTTP=404$') 'temporary relay reaches Anthropic with HTTP 404'
+    Assert-True (!$probe.Failed -and $http -match '^ANTHROPIC_HTTP=(401|403|404)$') 'temporary relay reaches Anthropic with an accepted unauthenticated HTTP response'
     Write-Output 'PASS test_temp_relay_http.ps1'
 }
 finally {
@@ -79,5 +83,4 @@ done
         [void](Invoke-Fixture $cleanup)
         [void](Invoke-Fixture "rm -rf -- '$script:FixtureHome'")
     }
-    if (Test-Path -LiteralPath $script:CommandFileWindows) { Remove-Item -LiteralPath $script:CommandFileWindows -Force -ErrorAction SilentlyContinue }
 }

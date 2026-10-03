@@ -37,8 +37,6 @@ WINDOWS_RELAY_ARGUMENTS = [
     "-NoLogo",
     "-NoProfile",
     "-NonInteractive",
-    "-ExecutionPolicy",
-    "Bypass",
     "-EncodedCommand",
     "__WINDOWS_RELAY_ENCODED__",
 ]
@@ -82,6 +80,7 @@ def write_all_cancellable(stream, data, client, process, cancel_requested):
     client_flags = select.POLLERR | select.POLLHUP
     client_flags |= getattr(select, "POLLRDHUP", 0)
     poller.register(client_fd, client_flags)
+    client_registered = True
     last_progress = time.monotonic()
 
     while view:
@@ -98,14 +97,15 @@ def write_all_cancellable(stream, data, client, process, cancel_requested):
                 if event & select.POLLERR:
                     raise ConnectionError("client connection failed during upload")
                 if event & (select.POLLHUP | getattr(select, "POLLRDHUP", 0)):
-                    try:
-                        probe = client.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT)
-                    except BlockingIOError:
-                        probe = None
-                    except (ConnectionError, OSError):
-                        raise ConnectionError("client disconnected during upload")
-                    if probe == b"":
-                        raise ConnectionError("client disconnected during upload")
+                    # A read-side FIN is a normal request boundary. All bytes
+                    # already returned by recv still belong to this upload and
+                    # must reach the child even when its pipe is backpressured.
+                    # POLLERR (and the bounded no-progress timeout) still
+                    # covers reset/broken peers. Stop watching the level-
+                    # triggered FIN so it cannot spin or discard this chunk.
+                    if client_registered:
+                        poller.unregister(client_fd)
+                        client_registered = False
             elif descriptor == pipe_fd:
                 if event & (select.POLLERR | select.POLLHUP):
                     raise BrokenPipeError("relay stdin closed")
@@ -119,9 +119,8 @@ def write_all_cancellable(stream, data, client, process, cancel_requested):
                         last_progress = time.monotonic()
                         made_progress = True
         if not made_progress and view:
-            # POLLHUP can remain level-triggered while unread client bytes are
-            # still buffered. Avoid a busy loop until the pipe progresses,
-            # cancellation arrives, or the bounded write-stall limit expires.
+            # Avoid a busy loop until the pipe progresses, cancellation
+            # arrives, or the bounded write-stall limit expires.
             time.sleep(0.01)
 
 

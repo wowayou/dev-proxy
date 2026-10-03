@@ -14,6 +14,8 @@ $script:DefaultProxyPort = 20122
 $script:WslInteropPort = 20180
 $script:WindowsRelayImplementationVersion = '3'
 $script:DryRun = $false
+$script:VerifyFailures = 0
+$script:HadFailures = $false
 foreach ($f in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
     . ([scriptblock]::Create($f.Extent.Text))
 }
@@ -46,6 +48,10 @@ try {
     $quoted = ConvertTo-BashSingleQuotedContent $danger
     Assert-Contains $quoted "'\''" 'shell quote escaping marker'
     Assert-Contains $quoted '$()' 'command substitution remains literal'
+    $unicodeQuote = [char]0x2019
+    $relayDanger = "127.0.0.1${unicodeQuote}+(Write-Output INJECTED)+${unicodeQuote}"
+    $relayQuoted = [Management.Automation.Language.CodeGeneration]::EscapeSingleQuotedStringContent($relayDanger)
+    Assert-True ($relayQuoted -notmatch "(?<!$unicodeQuote)$unicodeQuote(?!$unicodeQuote)") 'PowerShell relay quoting doubles typographic delimiters'
 
     $config = [pscustomobject]@{ proxyScheme='http'; proxyHost='127.0.0.1'; proxyPort=20122; noProxy='localhost'; enableWslMirrored=$true; enableWslInteropFallback=$true; distro='fixture'; wslInteropPort=20180 }
     $token1 = Get-InteropIdentityToken $config
@@ -104,17 +110,23 @@ try {
     Assert-Contains ([IO.File]::ReadAllText((Join-Path $fixture '.wslconfig'), [Text.Encoding]::UTF8)) 'autoProxy=user-edited' 'postinstall user edit retained'
     foreach ($conflict in @(@('[wsl2]','autoProxy=true'), @('[wsl2]'))) {
         [IO.File]::WriteAllLines((Join-Path $fixture '.wslconfig'), $conflict, (New-Object Text.UTF8Encoding($false)))
-        $config.enableWslMirrored = $false
-        $beforeFailures = $script:VerifyFailures
-        $script:DryRun = $true
-        Install-WslProxyEnv $config
-        $script:DryRun = $false
-        Assert-True ($script:VerifyFailures -gt $beforeFailures) 'autoProxy=true or missing/default conflict is reported as a failure'
+        Configure-WslProxyOwnership
+        $owned = [IO.File]::ReadAllText((Join-Path $fixture '.wslconfig'), [Text.Encoding]::UTF8)
+        Assert-Contains $owned 'autoProxy=false' 'NAT-mode ownership disables WSL autoProxy'
+        Assert-True ($owned -notmatch '(?im)^networkingMode=mirrored\s*$') 'NAT-mode ownership does not enable mirrored networking'
+        Restore-ManagedWslConfig
     }
     Remove-Item -LiteralPath (Join-Path $fixture '.wslconfig') -Force
+    Configure-WslProxyOwnership
+    $createdOwnership = [IO.File]::ReadAllText((Join-Path $fixture '.wslconfig'), [Text.Encoding]::UTF8)
+    Assert-Contains $createdOwnership 'autoProxy=false' 'missing .wslconfig is created with explicit proxy ownership'
+    Assert-True ($createdOwnership -notmatch '(?im)^networkingMode=mirrored\s*$') 'new NAT-mode config does not enable mirrored networking'
+    $config.enableWslMirrored = $false
     $beforeFailures = $script:VerifyFailures
+    $script:DryRun = $true
     Install-WslProxyEnv $config
-    Assert-True ($script:VerifyFailures -gt $beforeFailures) 'missing .wslconfig uses default autoProxy=true and is rejected'
+    $script:DryRun = $false
+    Assert-Equal $script:VerifyFailures $beforeFailures 'mirrored-disabled dry-run still installs the WSL profile'
 
     # A zero transport exit without the rollback's own completion marker must
     # never produce an OK result.
