@@ -179,6 +179,12 @@ awk '{print `$22}' "/proc/`$pid/stat" > "`$state/starttime"
     [void](Invoke-Fixture 'printf "echo login-profile-bypass\n" > "$HOME/.bash_profile"')
     Verify-All $config
     Assert-True ([bool]($script:LastFixtureResult.Lines -match '^WSL_PROFILE_BYPASSED path=')) 'verification detects a Bash login profile that bypasses ~/.profile'
+    foreach ($loginProfileText in @('. "${HOME}/.profile"', 'source "$HOME"/.profile', ". $script:FixtureHome/.profile")) {
+        $loginProfileBase64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes("$loginProfileText`n"))
+        [void](Invoke-Fixture "printf '%s' '$loginProfileBase64' | base64 -d > `"`$HOME/.bash_profile`"")
+        Verify-All $config
+        Assert-True (-not [bool]($script:LastFixtureResult.Lines -match '^WSL_PROFILE_BYPASSED path=')) "verification accepts login profile form: $loginProfileText"
+    }
     [void](Invoke-Fixture 'rm -f "$HOME/.bash_profile"')
 
     # An unavailable optional IPv6 fallback must not block installation of the
@@ -190,6 +196,26 @@ awk '{print `$22}' "/proc/`$pid/stat" > "`$state/starttime"
     $script:FixturePathPrefix = $null
     Assert-True (!$script:LastFixtureResult.Failed) 'missing IPv6 fallback capability does not abort installation'
     Assert-True ((Get-FixtureCount "grep -cxF `"DEV_PROXY_INTEROP_AVAILABLE='false'`" `"`$HOME/.config/dev-proxy/proxy-env.sh`"") -eq 1) 'installed profile records unavailable interop fallback'
+
+    # A prior generation or foreign listener must never receive traffic, but
+    # it also must not block installation of the independent direct/NAT paths.
+    $collisionPortResult = Invoke-Fixture "python3 -c 'import socket; s=socket.socket(socket.AF_INET6); s.bind((`"::1`",0)); print(s.getsockname()[1]); s.close()'"
+    $collisionPort = [int]((@($collisionPortResult.Lines) | Select-Object -Last 1) -join '').Trim()
+    $collisionCommand = @"
+nohup python3 -c 'import socket,sys,time; s=socket.socket(socket.AF_INET6); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); s.bind(("::1",int(sys.argv[1]))); s.listen(); time.sleep(120)' "$collisionPort" </dev/null >"`$HOME/collision-relay.log" 2>&1 &
+pid=`$!
+sleep 0.2
+printf 'COLLISION_PID=%s\n' "`$pid"
+printf 'COLLISION_START=%s\n' "`$(awk '{print `$22}' "/proc/`$pid/stat")"
+"@
+    $collisionStarted = Invoke-Fixture $collisionCommand
+    $collisionPid = [int]((Get-LastLine $collisionStarted 'COLLISION_PID=') -replace '^COLLISION_PID=', '')
+    $collisionStart = (Get-LastLine $collisionStarted 'COLLISION_START=') -replace '^COLLISION_START=', ''
+    $script:WslInteropPort = $collisionPort
+    Install-WslProxyEnv $config
+    Assert-True (!$script:LastFixtureResult.Failed) 'occupied fallback port does not abort direct/NAT installation'
+    Assert-True ([bool]($script:LastFixtureResult.Lines -match 'install-warning: WSL interop fallback is unavailable because relay port .* is occupied')) 'occupied fallback port emits an explicit warning'
+    Assert-True ((Get-FixtureCount "grep -cxF `"DEV_PROXY_INTEROP_AVAILABLE='false'`" `"`$HOME/.config/dev-proxy/proxy-env.sh`"") -eq 1) 'occupied fallback port is never enabled in the installed profile'
     Write-Output 'PASS test_wsl_install_review.ps1'
 }
 finally {
@@ -199,6 +225,9 @@ finally {
         }
         if ($foreignPid -and $foreignPid -match '^[0-9]+$') {
             [void](Invoke-Fixture ('if [ "$(awk ''{print $22}'' "/proc/' + $foreignPid + '/stat" 2>/dev/null)" = "' + $foreignStart + '" ]; then kill ' + $foreignPid + ' 2>/dev/null || true; fi'))
+        }
+        if ($collisionPid -and $collisionPid -match '^[0-9]+$') {
+            [void](Invoke-Fixture ('if [ "$(awk ''{print $22}'' "/proc/' + $collisionPid + '/stat" 2>/dev/null)" = "' + $collisionStart + '" ]; then kill ' + $collisionPid + ' 2>/dev/null || true; fi'))
         }
         [void](Invoke-Fixture "rm -rf -- '$script:FixtureHome'")
     }

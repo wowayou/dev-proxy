@@ -792,6 +792,43 @@ function Configure-WslMirrored {
     Write-Warn "Run 'wsl --shutdown' after saving work in WSL, then reopen WSL."
 }
 
+function Restore-WslMirroredValues($Lines) {
+    # Switching the saved preference off should undo only the mirrored values
+    # this tool previously wrote.  autoProxy remains managed by the generated
+    # shell profile, and unmarked/user-edited values remain untouched.
+    $expected = @{
+        "wsl2.networkingMode" = "networkingMode=mirrored"
+        "wsl2.dnsTunneling" = "dnsTunneling=true"
+    }
+    $restored = New-Object System.Collections.Generic.List[string]
+    for ($i = 0; $i -lt $Lines.Count; $i++) {
+        $line = $Lines[$i]
+        if ($line -match '^# dev-proxy managed: \[([^\]]+)\] ([^ ]+) previous=(.+)$') {
+            $managedKey = "$($Matches[1]).$($Matches[2])"
+            $previous = $Matches[3]
+            if ($expected.ContainsKey($managedKey)) {
+                $next = if ($i + 1 -lt $Lines.Count) { $Lines[$i + 1] } else { "" }
+                if ($next.Trim() -ieq $expected[$managedKey]) {
+                    if ($previous -ne "<absent>") {
+                        try {
+                            $restored.Add([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($previous)))
+                        } catch {
+                            $restored.Add($line)
+                            $restored.Add($next)
+                            Write-Warn "Could not decode the saved .wslconfig value for $managedKey; left it unchanged."
+                        }
+                    }
+                    $i++
+                    continue
+                }
+                Write-Warn "Managed .wslconfig value $managedKey was edited after setup; left it unchanged."
+            }
+        }
+        $restored.Add($line)
+    }
+    return @($restored.ToArray())
+}
+
 function Configure-WslProxyOwnership {
     $path = Join-Path $env:USERPROFILE ".wslconfig"
     $existing = @()
@@ -799,18 +836,19 @@ function Configure-WslProxyOwnership {
         $existing = @([IO.File]::ReadAllLines($path, [Text.Encoding]::UTF8))
     }
     # The generated shell profile is the single owner of proxy variables in
-    # both mirrored and NAT modes. Manage only autoProxy when the user does not
-    # want this tool to select mirrored networking.
-    $lines = Set-ManagedIniValue $existing "wsl2" "autoProxy" "false"
+    # both mirrored and NAT modes. Restore only mirrored settings this tool
+    # previously selected, then retain autoProxy ownership for the profile.
+    $lines = @(Restore-WslMirroredValues $existing)
+    $lines = Set-ManagedIniValue $lines "wsl2" "autoProxy" "false"
     if (($existing -join "`n") -eq (@($lines) -join "`n")) {
         Write-Ok "$path already disables WSL autoProxy for the dev-proxy shell profile"
         return
     }
     if ($DryRun) {
-        Write-Info "Dry-run: would update $path with autoProxy=false"
+        Write-Info "Dry-run: would restore managed mirrored settings and update $path with autoProxy=false"
         return
     }
-    Write-Info "Disabling WSL autoProxy so the generated shell profile remains the only proxy-variable owner."
+    Write-Info "Restoring tool-managed mirrored settings and disabling WSL autoProxy so the generated shell profile remains the only proxy-variable owner."
     if (Test-Path $path) {
         $backup = "$path.bak.$(Get-Date -Format yyyyMMddHHmmssfff)"
         Copy-Item $path $backup -Force
@@ -952,8 +990,8 @@ fi
 exec 9>"$HOME/.config/dev-proxy/interop-__INTEROP_PORT__.lock"
 flock -x 9
 # Preflight the optional IPv6 relay before replacing generated files. Missing
-# prerequisites disable only the fallback for this installed profile; a real
-# port collision still aborts so traffic is never handed to a foreign process.
+# prerequisites or an occupied relay port disable only the fallback for this
+# installed profile. The profile never sends traffic to an unverified process.
 interop_available=false
 if [ "__INTEROP_FALLBACK__" = "true" ]; then
   if ! command -v python3 >/dev/null 2>&1; then
@@ -986,8 +1024,8 @@ except OSError as bind_error:
         if argv[1].decode() != os.path.join(os.path.dirname(state), "interop-proxy.py") or argv[2].decode() != token:
             raise RuntimeError("identity mismatch")
     except Exception as exc:
-        print("install-error: relay port is occupied by an unknown or prior generation (%s)" % exc, file=sys.stderr)
-        raise SystemExit(1)
+        print("install-warning: WSL interop fallback is unavailable because relay port %s is occupied by an unknown or prior generation (%s); installing direct/NAT paths only" % (port, exc), file=sys.stderr)
+        raise SystemExit(2)
 PY
     relay_preflight_rc=$?
     set -e
@@ -1043,10 +1081,20 @@ else
   rm -f "$tmp_profile"
 fi
 printf 'installed:%s\n' "$HOME/.config/dev-proxy/proxy-env.sh"
+_dev_proxy_login_profile_loads_profile() {
+  grep -Ev '^[[:space:]]*#' "$1" \
+    | awk -v profile="$HOME/.profile" '{
+        while ((position = index($0, profile)) > 0) {
+          $0 = substr($0, 1, position - 1) "$HOME/.profile" substr($0, position + length(profile))
+        }
+        print
+      }' \
+    | sed -e 's/"//g' -e "s/'//g" -e 's/${HOME}/$HOME/g' \
+    | grep -Eq '(^|[;[:space:]])(\.|source)[[:space:]]+(\$HOME|~)/\.profile([;[:space:]]|$)'
+}
 for login_profile in "$HOME/.bash_profile" "$HOME/.bash_login"; do
   [ -f "$login_profile" ] || continue
-  if ! grep -Ev '^[[:space:]]*#' "$login_profile" \
-    | grep -Eq '(^|[;[:space:]])(\.|source)[[:space:]]+"?(\$HOME/|~/)\.profile"?([;[:space:]]|$)'; then
+  if ! _dev_proxy_login_profile_loads_profile "$login_profile"; then
     printf 'install-warning: %s exists and does not directly load ~/.profile; Bash login shells may skip the dev-proxy hook\n' "$login_profile" >&2
   fi
   break
@@ -1279,10 +1327,20 @@ if [ ! -f "$HOME/.profile" ] \
   printf 'CHECKS_DONE\n'
   exit 0
 fi
+_dev_proxy_login_profile_loads_profile() {
+  grep -Ev '^[[:space:]]*#' "$1" \
+    | awk -v profile="$HOME/.profile" '{
+        while ((position = index($0, profile)) > 0) {
+          $0 = substr($0, 1, position - 1) "$HOME/.profile" substr($0, position + length(profile))
+        }
+        print
+      }' \
+    | sed -e 's/"//g' -e "s/'//g" -e 's/${HOME}/$HOME/g' \
+    | grep -Eq '(^|[;[:space:]])(\.|source)[[:space:]]+(\$HOME|~)/\.profile([;[:space:]]|$)'
+}
 for login_profile in "$HOME/.bash_profile" "$HOME/.bash_login"; do
   [ -f "$login_profile" ] || continue
-  if ! grep -Ev '^[[:space:]]*#' "$login_profile" \
-    | grep -Eq '(^|[;[:space:]])(\.|source)[[:space:]]+"?(\$HOME/|~/)\.profile"?([;[:space:]]|$)'; then
+  if ! _dev_proxy_login_profile_loads_profile "$login_profile"; then
     printf 'WSL_PROFILE_BYPASSED path=%s\n' "$login_profile"
     printf 'CHECKS_DONE\n'
     exit 0
@@ -1653,7 +1711,7 @@ try {
                 Configure-WslMirrored
             } else {
                 Configure-WslProxyOwnership
-                Write-Warn "Saved WSL mirrored preference is disabled; only autoProxy ownership is managed in .wslconfig."
+                Write-Warn "Saved WSL mirrored preference is disabled; prior tool-managed mirrored settings are restored while autoProxy ownership remains managed."
                 Write-Warn "WSL NAT fallback requires your proxy client to accept non-loopback connections from the WSL vEthernet gateway."
             }
             Install-WslProxyEnv $config

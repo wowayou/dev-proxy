@@ -170,15 +170,18 @@ Windows 子进程输入管道正处于背压状态时，已经从 TCP 读取但�
 
 同轮修复还收紧了配置与验证语义：
 
-- 关闭 mirrored 时只管理全局 `autoProxy=false`，不启用 mirrored 或 DNS tunneling，
-  并继续安装所选发行版的 shell profile。
-- Python 3、Windows 进程互操作或 IPv6 回环不可用时，安装记录
-  `DEV_PROXY_INTEROP_AVAILABLE=false` 并保留直接 mirrored/NAT 路径；未知进程或旧
-  generation 占用 relay 端口仍是硬失败。
+- 关闭 mirrored 时恢复本工具此前托管的 `networkingMode` 与 `dnsTunneling`
+  原值，保留用户编辑/非托管值，继续管理全局 `autoProxy=false`，并安装所选
+  发行版的 shell profile。
+- Python 3、Windows 进程互操作、IPv6 回环不可用或 relay 端口被未知/旧 generation
+  占用时，安装记录 `DEV_PROXY_INTEROP_AVAILABLE=false` 并保留直接 mirrored/NAT
+  路径；占用进程不被复用或停止，可改用并行端口恢复 fallback。
 - Windows system proxy、用户级代理变量或 WSL profile hook 不匹配均计为验证失败。
   禁用后的验证不会直接加载生成文件，因此不会重启刚停止的 relay。
-- profile hook 改为 POSIX dot 语法并兼容迁移旧 `source` 行；安装与回滚保留
-  symlink，检测到 Bash login profile 绕过 `~/.profile` 时明确告警/失败。
+- profile hook 使用 POSIX dot 语法并兼容迁移旧 `source` 行；生成模板检测非 Bash
+  shell 后立即返回，避免 dash 执行 Bash 专用语法。安装与回滚保留 symlink；Bash
+  login profile 检测兼容 `${HOME}`、分段引号和绝对 HOME 路径，真实绕过
+  `~/.profile` 时仍明确告警/失败。
 - PowerShell relay 使用语言服务的单引号转义，Windows PowerShell 5.1 的本地化
   噪声正则保持 ASCII；`proxy_refresh` 保留失败状态，relay 日志按 generation
   隔离，直接候选探测上限缩短为 1 秒。
@@ -187,12 +190,13 @@ Windows 子进程输入管道正处于背压状态时，已经从 TCP 读取但�
 
 - Windows PowerShell 5.1 只读维护套件：20 passed、0 failed；包含所有 PowerShell
   文件解析、配置夹具、JSON/BOM、模板语法和 dry-run。
-- WSL runtime 与 shell：29 项中 28 passed、1 个显式真实 Windows case skipped；
+- WSL runtime 与 shell：30 项中 29 passed、1 个显式真实 Windows case skipped；
   大载荷 FIN 完整性用例另重复 5 次，5 次均通过。
 - 显式真实 Windows relay case 通过；FIN/RST 子进程 PID 41716、32052 均回收，
   Linux relay 回到 1 个线程、4 个文件描述符。
 - PowerShell 5.1 的隔离安装/禁用/验证夹具、WSL 载荷传输夹具通过；覆盖 symlink
-  保留、禁用后不重启 relay、缺少 IPv6 fallback 能力仍安装。
+  保留、禁用后不重启 relay、常见 Bash login profile 写法、缺少 IPv6 fallback
+  能力或端口被旧 generation 占用时仍安装且不使用该端口。
 - 动态 `[::1]` 临时 relay 集成测试经 `mirrored-interop` 到 Anthropic 返回 HTTP
   404；测试自行清理临时 HOME 与 relay。
 

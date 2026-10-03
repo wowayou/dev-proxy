@@ -23,7 +23,7 @@ This is a standalone Windows and WSL ops tool. Its deployment location is `C:\Us
 
 When `enableWslMirrored` is `true`, non-interactive setup may update `%USERPROFILE%\.wslconfig` so WSL can reach Windows localhost, such as `127.0.0.1:20122`.
 
-When it is `false`, non-interactive setup must still install the WSL shell proxy profile. It may manage only `[wsl2] autoProxy=false` in `.wslconfig`; it must not enable mirrored networking or DNS tunneling. WSL then falls back to the Windows vEthernet gateway, for example `172.17.0.1`. That requires the Windows proxy client to accept non-loopback connections.
+When it is `false`, non-interactive setup must still install the WSL shell proxy profile. It restores only mirrored networking and DNS tunneling values previously managed by this tool, continues to manage `[wsl2] autoProxy=false`, and must not enable mirrored networking or DNS tunneling. WSL then falls back to the Windows vEthernet gateway, for example `172.17.0.1`. That requires the Windows proxy client to accept non-loopback connections.
 
 ## Verification
 

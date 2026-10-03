@@ -108,6 +108,18 @@ try {
     [IO.File]::WriteAllLines((Join-Path $fixture '.wslconfig'), $edited, (New-Object Text.UTF8Encoding($false)))
     Restore-ManagedWslConfig
     Assert-Contains ([IO.File]::ReadAllText((Join-Path $fixture '.wslconfig'), [Text.Encoding]::UTF8)) 'autoProxy=user-edited' 'postinstall user edit retained'
+    $switchBaseline = @('[wsl2]','networkingMode=nat','dnsTunneling=false','autoProxy=true')
+    $switchManaged = $switchBaseline
+    foreach ($item in @(@('wsl2','networkingMode','mirrored'),@('wsl2','dnsTunneling','true'),@('wsl2','autoProxy','false'))) {
+        $switchManaged = Set-ManagedIniValue $switchManaged $item[0] $item[1] $item[2]
+    }
+    [IO.File]::WriteAllLines((Join-Path $fixture '.wslconfig'), $switchManaged, (New-Object Text.UTF8Encoding($false)))
+    Configure-WslProxyOwnership
+    $switched = [IO.File]::ReadAllText((Join-Path $fixture '.wslconfig'), [Text.Encoding]::UTF8)
+    Assert-Contains $switched 'networkingMode=nat' 'disabling mirrored restores the prior networking mode'
+    Assert-Contains $switched 'dnsTunneling=false' 'disabling mirrored restores the prior DNS tunneling value'
+    Assert-Contains $switched 'autoProxy=false' 'disabling mirrored retains shell-profile proxy ownership'
+    Assert-True ($switched -notmatch '(?m)^# dev-proxy managed: \[wsl2\] (networkingMode|dnsTunneling) ') 'restored mirrored markers are removed'
     foreach ($conflict in @(@('[wsl2]','autoProxy=true'), @('[wsl2]'))) {
         [IO.File]::WriteAllLines((Join-Path $fixture '.wslconfig'), $conflict, (New-Object Text.UTF8Encoding($false)))
         Configure-WslProxyOwnership

@@ -1,6 +1,10 @@
 # Dev proxy environment for WSL shells.
 # This file is generated from a Windows-side tool. It is safe to source more than once.
 
+# ~/.profile can also be loaded by POSIX shells such as dash.  The generated
+# helpers use Bash-only syntax, so leave non-Bash login shells untouched.
+[ -n "${BASH_VERSION:-}" ] || return 0
+
 DEV_PROXY_SCHEME_DEFAULT='__PROXY_SCHEME__'
 DEV_PROXY_TARGET_HOST_DEFAULT='__PROXY_HOST__'
 DEV_PROXY_TARGET_PORT='__PROXY_PORT__'
@@ -249,7 +253,7 @@ _dev_proxy_resolve_host() {
         printf 'dev-proxy: %s\n' "${_dev_proxy_interop_error}" >&2
       fi
     elif [ "${DEV_PROXY_INTEROP_FALLBACK}" = "true" ]; then
-      printf 'dev-proxy: interop fallback is unavailable in this installed profile; reinstall after restoring Python 3 and IPv6 loopback\n' >&2
+      printf 'dev-proxy: interop fallback is unavailable in this installed profile; reinstall after restoring its prerequisites or choosing a free relay port\n' >&2
     fi
 
     # Keep the preferred address visible when it is unreachable so verification

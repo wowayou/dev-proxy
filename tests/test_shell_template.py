@@ -5,6 +5,7 @@ installed user profile or touches the production relay state.
 """
 
 import os
+import shutil
 import socket
 import stat
 import subprocess
@@ -229,6 +230,16 @@ class ShellTemplateTests(unittest.TestCase):
         result = self._source("proxy_refresh; printf 'REFRESH_RC=%s\\n' \"$?\"")
         self.assertEqual(0, result.returncode)
         self.assertIn("REFRESH_RC=1", result.stdout)
+
+    @unittest.skipUnless(shutil.which("dash"), "dash is required for the non-Bash profile check")
+    def test_dash_profile_source_returns_without_running_bash_helpers(self):
+        result = subprocess.run(
+            ["dash", "-c", f'. "{self.profile}"; printf "AFTER=%s\\n" "${{DEV_PROXY_SCHEME_DEFAULT-unset}}"'],
+            env=self.env, text=True, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, check=False,
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("AFTER=unset", result.stdout)
 
     def test_old_generation_listener_is_not_claimed_by_new_token(self):
         old_token = "b" * 64

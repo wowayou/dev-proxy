@@ -129,12 +129,14 @@ mirrored path. With the default `true`, WSL first tries the configured Windows
 listener directly (normally `127.0.0.1:20122`) and starts the `[::1]` relay only
 when every direct mirrored candidate is unreachable. Set it to `false` to
 disable relay startup without disabling mirrored networking itself. Installation
-preflights Python 3, Windows process interop, and IPv6 loopback; if any is
-unavailable, it warns and
+preflights Python 3, Windows process interop, IPv6 loopback, and ownership of
+the configured relay port; if any is unavailable, it warns and
 records `DEV_PROXY_INTEROP_AVAILABLE=false` in that distro's generated profile,
-while keeping direct mirrored and NAT paths usable.
+while keeping direct mirrored and NAT paths usable. An unknown or older relay
+on that port is left running but is never selected by the newly installed
+profile; choose another `wslInteropPort` to restore the fallback.
 
-`enableWslMirrored` is a visible user preference. The menu header shows it, options 1 and 4 both let you change it, and both save the answer back to `config.json`. `noProxy` feeds the CLI bypass variables and the Windows system-proxy bypass list; entries that start with a dot, such as `.local`, are rewritten to the `*.local` form WinINet expects. Values are validated on load, so an out-of-range port or an unknown scheme falls back to the default with a warning instead of being written to the registry. In `-NonInteractive` mode, mirrored networking and DNS settings are applied only when this value is `true`; the WSL shell proxy environment is installed either way. When it is `false`, the tool manages only `autoProxy=false` in `.wslconfig` so WSL's automatic proxy import cannot conflict with the generated shell profile.
+`enableWslMirrored` is a visible user preference. The menu header shows it, options 1 and 4 both let you change it, and both save the answer back to `config.json`. `noProxy` feeds the CLI bypass variables and the Windows system-proxy bypass list; entries that start with a dot, such as `.local`, are rewritten to the `*.local` form WinINet expects. Values are validated on load, so an out-of-range port or an unknown scheme falls back to the default with a warning instead of being written to the registry. In `-NonInteractive` mode, mirrored networking and DNS settings are applied only when this value is `true`; the WSL shell proxy environment is installed either way. When it changes to `false`, the tool restores the prior `networkingMode` and `dnsTunneling` values recorded by its own management markers, leaves user-edited or unowned settings alone, and continues to manage `autoProxy=false` so WSL's automatic proxy import cannot conflict with the generated shell profile.
 
 ## Windows Behavior
 
@@ -167,6 +169,13 @@ Path selection happens when the profile is loaded or `proxy_refresh` runs; it
 does not retry an individual request through another path after that request
 has already failed.
 
+The hook in `~/.profile` is POSIX-compatible, but the generated helper file is
+intentionally Bash-only and returns immediately when `.profile` is loaded by
+dash or another non-Bash shell. If `.bash_profile` or `.bash_login` exists,
+installation and verification recognize common ways of loading `.profile`,
+including `${HOME}`, split quotes such as `"$HOME"/.profile`, and the absolute
+home path.
+
 `proxy_status` reports `DEV_PROXY_NETWORKING_MODE` and identifies `DEV_PROXY_HOST_SOURCE` as `mirrored-interop`, `mirrored-localhost`, `mirrored-host-address`, `nat-gateway`, or `override`.
 
 The WSL profile dynamically resolves the Windows proxy host, using
@@ -188,7 +197,8 @@ The WSL profile dynamically resolves the Windows proxy host, using
 
 Option 4 backs up `.wslconfig` and always sets global WSL2 `autoProxy=false`.
 When mirrored mode is enabled it also enables mirrored networking and DNS
-tunneling; when mirrored mode is disabled it leaves those settings alone. A
+tunneling; when mirrored mode is disabled it restores only the prior values
+saved by this tool for those two settings. A
 new install does not add `hostAddressLoopback` or
 `ignoredPorts`; the IPv6 loopback relay does not need either setting. Legacy
 management markers for those keys remain understood until an explicit

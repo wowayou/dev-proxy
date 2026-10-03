@@ -42,10 +42,12 @@ backpressure cannot leak a child indefinitely; healthy idle or streaming
 connections may remain open indefinitely. NAT mode uses only the WSL
 default-route gateway, selected from `wslinfo --networking-mode` and route
 state. Python 3, Windows interop, and Linux IPv6 loopback are prerequisites.
-If Python 3 or IPv6 loopback is unavailable during installation, only the
-optional interop fallback is marked unavailable; direct mirrored and NAT
-profile paths must still install. With mirrored mode disabled, the tool manages
-only `autoProxy=false` in `.wslconfig` and must not enable mirrored networking.
+If Python 3, Windows interop, IPv6 loopback, or an unoccupied verified relay
+port is unavailable during installation, only the optional interop fallback is
+marked unavailable; direct mirrored and NAT profile paths must still install.
+With mirrored mode disabled, the tool restores its own managed
+`networkingMode` and `dnsTunneling` values, continues to manage
+`autoProxy=false`, and must not enable mirrored networking.
 The loopback listener is a transport boundary, not user authentication.
 
 ## Mirrored Vs NAT Reasoning
