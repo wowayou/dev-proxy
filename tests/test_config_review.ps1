@@ -140,6 +140,15 @@ try {
     $script:DryRun = $false
     Assert-Equal $script:VerifyFailures $beforeFailures 'mirrored-disabled dry-run still installs the WSL profile'
 
+    $applyWslFunction = $ast.Find({
+        param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Apply-WslProxy'
+    }, $true).Extent.Text
+    Assert-Contains $applyWslFunction 'No restores prior .wslconfig values managed by this tool for all WSL 2 distros' 'option 4 explains that No restores global managed settings'
+    Assert-Contains $applyWslFunction 'Restoring tool-managed mirrored settings; keeping autoProxy=false' 'option 4 progress describes the NAT transition'
+    Assert-Contains $applyWslFunction 'Any networkingMode and dnsTunneling values managed by this tool were restored' 'option 4 warning describes the completed restoration'
+    Assert-True ($applyWslFunction -notmatch 'Mirrored networking was skipped') 'option 4 no longer describes the restoration as skipped'
+
     # A zero transport exit without the rollback's own completion marker must
     # never produce an OK result.
     $script:CapturedOk = @()

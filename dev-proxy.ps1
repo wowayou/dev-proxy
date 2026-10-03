@@ -1620,7 +1620,7 @@ function Apply-WslProxy($Config) {
     $useMirrored = if ($NonInteractive) {
         [bool]$Config.enableWslMirrored
     } else {
-        Read-YesNo "Update %USERPROFILE%\.wslconfig for mirrored networking?" ([bool]$Config.enableWslMirrored)
+        Read-YesNo "Use WSL mirrored networking? (No restores prior .wslconfig values managed by this tool for all WSL 2 distros)" ([bool]$Config.enableWslMirrored)
     }
     $Config.enableWslMirrored = $useMirrored
     Save-Config $Config
@@ -1628,9 +1628,9 @@ function Apply-WslProxy($Config) {
         Show-Progress $activity "Updating .wslconfig for mirrored networking" 45
         Configure-WslMirrored
     } else {
-        Show-Progress $activity "Disabling WSL autoProxy ownership conflict" 45
+        Show-Progress $activity "Restoring tool-managed mirrored settings; keeping autoProxy=false" 45
         Configure-WslProxyOwnership
-        Write-Warn "Mirrored networking was skipped. WSL will fall back to the Windows host IP; this only works if your proxy client accepts non-loopback connections."
+        Write-Warn "Mirrored networking preference is disabled. Any networkingMode and dnsTunneling values managed by this tool were restored. If WSL runs in NAT mode, the proxy client must accept connections on a non-loopback Windows address."
     }
     Show-Progress $activity "Installing WSL shell proxy environment" 75
     Install-WslProxyEnv $Config
