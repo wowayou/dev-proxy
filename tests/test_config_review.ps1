@@ -148,6 +148,11 @@ try {
     Assert-Contains $applyWslFunction 'Restoring tool-managed mirrored settings; keeping autoProxy=false' 'option 4 progress describes the NAT transition'
     Assert-Contains $applyWslFunction 'Any networkingMode and dnsTunneling values managed by this tool were restored' 'option 4 warning describes the completed restoration'
     Assert-True ($applyWslFunction -notmatch 'Mirrored networking was skipped') 'option 4 no longer describes the restoration as skipped'
+    $proxyOwnershipFunction = $ast.Find({
+        param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Configure-WslProxyOwnership'
+    }, $true).Extent.Text
+    Assert-Contains $proxyOwnershipFunction 'restored any tool-managed mirrored settings and set autoProxy=false' 'option 4 success message describes both changes'
 
     # A zero transport exit without the rollback's own completion marker must
     # never produce an OK result.

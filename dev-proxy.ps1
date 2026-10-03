@@ -855,7 +855,7 @@ function Configure-WslProxyOwnership {
         Write-Info "Backed up existing .wslconfig to $backup"
     }
     [IO.File]::WriteAllLines($path, @($lines), (New-Object Text.UTF8Encoding($false)))
-    Write-Ok "Updated $path with autoProxy=false"
+    Write-Ok "Updated ${path}: restored any tool-managed mirrored settings and set autoProxy=false"
     Write-Warn "Run 'wsl --shutdown' after saving work in WSL, then reopen WSL."
 }
 
