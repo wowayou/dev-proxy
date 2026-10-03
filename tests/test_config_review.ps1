@@ -115,6 +115,21 @@ try {
     $beforeFailures = $script:VerifyFailures
     Install-WslProxyEnv $config
     Assert-True ($script:VerifyFailures -gt $beforeFailures) 'missing .wslconfig uses default autoProxy=true and is rejected'
+
+    # A zero transport exit without the rollback's own completion marker must
+    # never produce an OK result.
+    $script:CapturedOk = @()
+    function Write-Ok($Message) { $script:CapturedOk += "$Message" }
+    function Write-WslOutputLines($Output) { }
+    function Invoke-WslBash {
+        [pscustomobject]@{ ExitCode = 0; TimedOut = $false; Completed = $true; Failed = $false; Lines = @('legacy-relay-preserved') }
+    }
+    $config.distro = 'fixture'
+    $script:DryRun = $false
+    $beforeFailures = $script:VerifyFailures
+    Disable-WslProxyEnv $config
+    Assert-True ($script:VerifyFailures -gt $beforeFailures) 'rollback without a business completion marker fails'
+    Assert-True ($script:CapturedOk.Count -eq 0) 'rollback without a completion marker prints no success'
     Write-Output 'PASS test_config_review.ps1'
 } finally {
     $script:ConfigPath = $oldConfigPath

@@ -139,6 +139,7 @@ awk '{print `$22}' "/proc/`$pid/stat" > "`$state/starttime"
     [void](Disable-WslProxyEnv $config)
     $disable = $script:LastFixtureResult
     Assert-Contains $disable.Lines 'legacy-relay-preserved' 'rollback reports preserved legacy PID'
+    Assert-Contains $disable.Lines 'disable-complete:disabled' 'rollback reports an explicit completion marker'
     Assert-True ((Get-FixtureCount "if kill -0 $oldPid 2>/dev/null; then echo 1; else echo 0; fi") -eq 0) 'rollback stops installed old generation'
     Assert-True ((Get-FixtureCount "if kill -0 $foreignPid 2>/dev/null; then echo 0; else echo 1; fi") -eq 0) 'rollback preserves foreign relay'
     Assert-True ((Get-FixtureCount "grep -cF '# disabled by dev-proxy: $sourceLine' $profile || true") -eq 1) 'rollback comments source exactly once'
@@ -146,7 +147,7 @@ awk '{print `$22}' "/proc/`$pid/stat" > "`$state/starttime"
 
     [void](Disable-WslProxyEnv $config)
     $disableAgain = $script:LastFixtureResult
-    Assert-Contains $disableAgain.Lines 'already-disabled' 'repeat rollback is idempotent'
+    Assert-Contains $disableAgain.Lines 'disable-complete:already-disabled' 'repeat rollback is idempotent'
     Assert-Contains $disableAgain.Lines 'legacy-relay-preserved' 'repeat rollback still reports legacy PID'
     Assert-True ((Get-FixtureCount 'find "$HOME" -maxdepth 1 -name ''.profile.dev-proxy.bak.*'' | wc -l') -eq $afterDisableBackups) 'repeat rollback adds no backup'
 

@@ -159,6 +159,9 @@ After installing or migrating the profile, use a new WSL terminal or run
 `source ~/.profile` in an existing Bash shell. `proxy_refresh` re-resolves the
 relay for the current shell, but it cannot replace environment variables or
 runtime functions already captured by an older shell/profile generation.
+Path selection happens when the profile is loaded or `proxy_refresh` runs; it
+does not retry an individual request through another path after that request
+has already failed.
 
 `proxy_status` reports `DEV_PROXY_NETWORKING_MODE` and identifies `DEV_PROXY_HOST_SOURCE` as `mirrored-interop`, `mirrored-localhost`, `mirrored-host-address`, `nat-gateway`, or `override`.
 
@@ -257,10 +260,12 @@ decrypt HTTPS.
   the cost of a Windows PowerShell process; this is not a high-throughput
   multi-user proxy service. The relay caps active connections at 32, waits up
   to 10 seconds for the first request bytes, and allows up to 3 seconds to
-  drain a response after client EOF before reaping the child. Healthy streaming
-  connections are not cut off by an idle-duration limit. That bounded
-  half-close drain can add latency or truncate a peer that needs more than
-  3 seconds to deliver its final response bytes.
+  drain a response after client EOF before reaping the child. When request
+  bytes are pending but the Windows child pipe makes no progress for 10
+  seconds, the relay cancels that connection and reaps its child. Healthy idle
+  or streaming connections are not cut off by an idle-duration limit. These
+  bounded drain and blocked-write windows can truncate a peer that needs more
+  time to make progress.
 - An HTTP `401`, `403`, or `404` in verification proves network connectivity,
   not valid API credentials, model permissions, quota, or successful inference.
 - HTTPS websites reached through an HTTP proxy are carried as opaque bytes; the

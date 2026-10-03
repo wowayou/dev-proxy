@@ -412,7 +412,67 @@ function Get-WslCleanLines($Output) {
 
 function Get-WslFailureReason($Result) {
     if ($Result.TimedOut) { return "the WSL command timed out" }
+    if ($Result.PSObject.Properties.Name -contains "Completed" -and !$Result.Completed) {
+        return "the WSL command did not report a verified completion marker"
+    }
     return "the WSL command exited with code $($Result.ExitCode)"
+}
+
+function New-WslPayloadRunner([int]$TimeoutSec, [int]$ExpectedBytes, [string]$ExpectedSha256, [string]$CompletionMarker) {
+    # Only numeric/hex values and the generated alphanumeric marker are
+    # interpolated. The command itself arrives as base64 on standard input.
+    if ($TimeoutSec -lt 1 -or $ExpectedBytes -lt 1 -or $ExpectedSha256 -notmatch '^[0-9a-f]{64}$' -or $CompletionMarker -notmatch '^[A-Za-z0-9_]+$') {
+        throw "Invalid WSL payload runner parameters."
+    }
+    return @"
+payload=`$(mktemp)
+trap 'rm -f "`$payload"' EXIT
+if ! LC_ALL=C sed '1s/^\xEF\xBB\xBF//' | tr -d '\r\n' | base64 -d > "`$payload"; then
+  printf 'dev-proxy: WSL payload decode failed\n' >&2
+  exit 65
+fi
+actual_bytes=`$(wc -c < "`$payload" | tr -d '[:space:]')
+actual_sha=`$(sha256sum "`$payload" 2>/dev/null | awk '{print `$1}')
+if [ "`$actual_bytes" != '$ExpectedBytes' ] || [ "`$actual_sha" != '$ExpectedSha256' ]; then
+  printf 'dev-proxy: WSL payload integrity check failed\n' >&2
+  exit 65
+fi
+timeout $TimeoutSec bash "`$payload"
+command_rc=`$?
+if [ "`$command_rc" -eq 0 ]; then
+  printf '%s\n' '$CompletionMarker'
+fi
+exit "`$command_rc"
+"@
+}
+
+function New-WslRunnerBootstrap([string]$Runner) {
+    # Keep the verified runner itself out of native Windows argument quoting.
+    # Bash reads it from a process-substitution descriptor, leaving standard
+    # input exclusively for the command payload.
+    $runnerBase64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($Runner))
+    return "bash <(printf %s $runnerBase64 | base64 -d)"
+}
+
+function ConvertTo-WslCommandResult($Raw, [int]$ExitCode, [string]$CompletionMarker) {
+    $lines = @()
+    $completionCount = 0
+    foreach ($item in @($Raw)) {
+        $line = if ($item -is [System.Management.Automation.ErrorRecord]) { $item.Exception.Message } else { "$item" }
+        if ($line -eq $CompletionMarker) {
+            $completionCount++
+        } else {
+            $lines += $line
+        }
+    }
+    $completed = ($completionCount -eq 1)
+    return [pscustomobject]@{
+        ExitCode = $ExitCode
+        TimedOut = ($ExitCode -eq 124)
+        Completed = $completed
+        Failed = ($ExitCode -ne 0 -or !$completed)
+        Lines = @($lines)
+    }
 }
 
 function Invoke-WslBash {
@@ -425,50 +485,44 @@ function Invoke-WslBash {
     )
 
     $oldPreference = $ErrorActionPreference
+    $oldOutputEncoding = $OutputEncoding
     try {
         $ErrorActionPreference = "Continue"
-        # Pass WSL scripts as base64 to avoid PowerShell/native quoting issues with multiline bash.
-        # The WSL-side timeout keeps the menu from hanging on bad profiles or startup warnings.
+        # Keep the transport body in the ASCII subset. Some Windows PowerShell
+        # 5.1 -> wsl.exe paths still prefix native-pipeline input with a UTF-8
+        # BOM; the WSL runner removes that optional prefix before decoding.
+        $OutputEncoding = New-Object Text.ASCIIEncoding
+        # Pass WSL scripts as base64 on standard input to avoid PowerShell/native
+        # quoting issues and any dependency on Windows-drive mount paths. The
+        # WSL-side runner verifies exact bytes before execution and emits a
+        # per-call completion marker only after a successful command.
         $normalizedCommand = $Command -replace "`r`n", "`n"
         $normalizedCommand = $normalizedCommand -replace "`r", "`n"
-        $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($normalizedCommand))
-        # Keep the base64 payload in a short-lived same-directory file rather
-        # than in the wsl.exe command line. Generated installs contain both
-        # templates and can exceed the Windows native command-line limit.
-        $commandFile = Join-Path $ScriptRoot ".tmp-wsl-command-$PID.b64"
-        $drive = $commandFile.Substring(0, 1).ToLowerInvariant()
-        $wslCommandFile = "/mnt/$drive$($commandFile.Substring(2).Replace('\', '/'))"
-        [IO.File]::WriteAllText($commandFile, $encodedCommand, (New-Object Text.UTF8Encoding($false)))
-        $runner = "base64 -d < '$wslCommandFile' | timeout $TimeoutSec bash"
+        $commandBytes = [Text.Encoding]::UTF8.GetBytes($normalizedCommand)
+        $encodedCommand = [Convert]::ToBase64String($commandBytes)
+        $sha = [Security.Cryptography.SHA256]::Create()
         try {
-            $raw = & wsl.exe -d $Distro -- bash -c $runner 2>&1
+            $expectedSha = (([BitConverter]::ToString($sha.ComputeHash($commandBytes))) -replace "-", "").ToLowerInvariant()
         } finally {
-            Remove-Item -LiteralPath $commandFile -Force -ErrorAction SilentlyContinue
+            $sha.Dispose()
         }
+        $completionMarker = "DEV_PROXY_WSL_COMPLETE_$([guid]::NewGuid().ToString('N'))"
+        $runner = New-WslPayloadRunner -TimeoutSec $TimeoutSec -ExpectedBytes $commandBytes.Length -ExpectedSha256 $expectedSha -CompletionMarker $completionMarker
+        $bootstrap = New-WslRunnerBootstrap $runner
+        $raw = $encodedCommand | & wsl.exe -d $Distro -- bash -c $bootstrap 2>&1
         $exitCode = $LASTEXITCODE
-        $result = @()
-        foreach ($item in $raw) {
-            if ($item -is [System.Management.Automation.ErrorRecord]) {
-                $result += $item.Exception.Message
-            } else {
-                $result += "$item"
-            }
-        }
-        return [pscustomobject]@{
-            ExitCode = $exitCode
-            TimedOut = ($exitCode -eq 124)
-            Failed = ($exitCode -ne 0)
-            Lines = @($result)
-        }
+        return ConvertTo-WslCommandResult -Raw $raw -ExitCode $exitCode -CompletionMarker $completionMarker
     } catch {
         return [pscustomobject]@{
             ExitCode = -1
             TimedOut = $false
+            Completed = $false
             Failed = $true
             Lines = @($_.Exception.Message)
         }
     } finally {
         $ErrorActionPreference = $oldPreference
+        $OutputEncoding = $oldOutputEncoding
     }
 }
 
@@ -1021,7 +1075,7 @@ if [ -f "$BASE/interop-proxy.pid" ]; then
 fi
 if [ ! -f "$HOME/.profile" ] || ! grep -qxF "$SOURCE_LINE" "$HOME/.profile"; then
   # Nothing active to disable, so do not leave another backup behind.
-  printf 'already-disabled\n'
+  printf 'disable-complete:already-disabled\n'
   exit 0
 fi
 profile_backup="$(mktemp "$HOME/.profile.dev-proxy.bak.XXXXXX")"
@@ -1029,7 +1083,7 @@ cp "$HOME/.profile" "$profile_backup"
 tmp="$(mktemp)"
 awk '{ if ($0 == "source \"$HOME/.config/dev-proxy/proxy-env.sh\"") print "# disabled by dev-proxy: " $0; else print $0 }' "$HOME/.profile" > "$tmp"
 mv "$tmp" "$HOME/.profile"
-printf 'disabled\n'
+printf 'disable-complete:disabled\n'
 '@
     $result = Invoke-WslBash -Distro $Config.distro -Command $cmd
     $parsed = Split-WslOutput $result.Lines
@@ -1044,7 +1098,13 @@ printf 'disabled\n'
         Write-Fail "Could not stop one or more managed WSL relay processes; state was retained for retry."
         return
     }
-    if ($parsed.Lines -contains "already-disabled") {
+    $completion = @($parsed.Lines | Where-Object { $_ -match '^disable-complete:(already-disabled|disabled)$' })
+    if ($completion.Count -ne 1) {
+        Write-WslOutputLines $parsed
+        Write-Fail "Could not verify WSL rollback completion for $($Config.distro); no unique completion marker was returned."
+        return
+    }
+    if ($parsed.Lines -contains "disable-complete:already-disabled") {
         Write-Ok "WSL proxy source line was already disabled for $($Config.distro)"
         return
     }

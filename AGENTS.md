@@ -36,7 +36,9 @@ listener (normally `127.0.0.1:20122`). When that path is unreachable and
 (`[::1]:wslInteropPort`) reaches the listener through one Windows PowerShell
 interop process per active non-empty connection. The relay's current
 operational limits are 32 active connections, a 10-second first-byte wait, and
-a 3-second response-drain window after client EOF; healthy streaming
+a 3-second response-drain window after client EOF. A child-pipe write with
+pending bytes is cancelled after 10 seconds without progress so downstream
+backpressure cannot leak a child indefinitely; healthy idle or streaming
 connections may remain open indefinitely. NAT mode uses only the WSL
 default-route gateway, selected from `wslinfo --networking-mode` and route
 state. Python 3, Windows interop, and Linux IPv6 loopback are prerequisites.

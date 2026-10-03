@@ -43,6 +43,10 @@ FAKE_RELAY = textwrap.dedent(
         except FileNotFoundError:
             pass
 
+    if mode == "no-read":
+        time.sleep(30)
+        raise SystemExit(0)
+
     while True:
         chunk = os.read(0, 65536)
         if not chunk:
@@ -148,6 +152,42 @@ class InteropRuntimeTests(unittest.TestCase):
             return True
         return True
 
+    @staticmethod
+    def _linux_counts(pid):
+        return (
+            len(list((Path("/proc") / str(pid) / "task").iterdir())),
+            len(list((Path("/proc") / str(pid) / "fd").iterdir())),
+        )
+
+    def _wait_linux_quiescent(self, baseline, timeout=10):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self._linux_counts(self.server.pid) == baseline:
+                return
+            time.sleep(0.05)
+        self.fail(
+            "Linux daemon did not return to baseline threads/fds: %s != %s"
+            % (self._linux_counts(self.server.pid), baseline)
+        )
+
+    def _start_blocked_upload(self):
+        self.mode_file.write_text("no-read", encoding="ascii")
+        client = self._connect()
+        client.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 65536)
+        errors = []
+
+        def send_large_request():
+            try:
+                client.sendall(b"x" * (8 * 1024 * 1024))
+            except (BrokenPipeError, ConnectionError, OSError) as error:
+                errors.append(error)
+
+        sender = threading.Thread(target=send_large_request, daemon=True)
+        sender.start()
+        self._wait_markers(1)
+        time.sleep(0.3)
+        return client, sender, errors
+
     def _wait_children_gone(self, timeout=6):
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
@@ -229,6 +269,48 @@ class InteropRuntimeTests(unittest.TestCase):
         self.assertEqual(b"", self._read_until_eof(client))
         client.close()
         self._wait_children_gone()
+
+    def test_blocked_upload_rst_reclaims_child_threads_fds_and_slot(self):
+        time.sleep(0.2)
+        baseline = self._linux_counts(self.server.pid)
+        client, sender, _errors = self._start_blocked_upload()
+        client.setsockopt(
+            socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0)
+        )
+        try:
+            client.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        client.close()
+        sender.join(timeout=5)
+        self.assertFalse(sender.is_alive())
+        self._wait_children_gone(timeout=8)
+        self._wait_linux_quiescent(baseline)
+        self.assertIsNone(self.server.poll())
+
+        # The connection permit must also be reusable after the blocked path.
+        self.mode_file.write_text("echo", encoding="ascii")
+        probe = self._connect()
+        probe.sendall(b"ok")
+        self.assertEqual(b"ok", probe.recv(2))
+        probe.close()
+        self._wait_markers(2)
+        self._wait_children_gone(timeout=8)
+        self._wait_linux_quiescent(baseline)
+
+    def test_daemon_shutdown_reaps_child_during_blocked_upload(self):
+        client, sender, _errors = self._start_blocked_upload()
+        self.server.terminate()
+        self.server.wait(timeout=10)
+        self.assertEqual(0, self.server.returncode)
+        try:
+            client.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        client.close()
+        sender.join(timeout=5)
+        self.assertFalse(sender.is_alive())
+        self._wait_children_gone(timeout=8)
 
     def test_child_exit_closes_a_still_silent_client(self):
         self.mode_file.write_text("exit", encoding="ascii")

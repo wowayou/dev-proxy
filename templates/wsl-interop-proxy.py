@@ -8,6 +8,7 @@ TCP probe therefore never creates a Windows child. The generated relay script
 
 import glob
 import os
+import select
 import shutil
 import socket
 import stat
@@ -26,6 +27,8 @@ FIRST_READ_TIMEOUT = 10.0
 CONNECTION_DRAIN_TIMEOUT = 3.0
 PROCESS_WAIT_TIMEOUT = 3.0
 THREAD_JOIN_TIMEOUT = 1.0
+PIPE_WRITE_STALL_TIMEOUT = 10.0
+PIPE_POLL_INTERVAL_MS = 100
 
 # Keep the generated PowerShell payload separate from the executable. The
 # executable and WSL_INTEROP socket are resolved for every child process so a
@@ -60,6 +63,66 @@ def write_all(stream, data):
         if written is None or written <= 0:
             raise BrokenPipeError("relay stdin made no progress")
         view = view[written:]
+
+
+def write_all_cancellable(stream, data, client, process, cancel_requested):
+    """Write bytes to a nonblocking child pipe while observing cancellation.
+
+    A blocking pipe write cannot notice that the TCP peer reset or that the
+    daemon received SIGTERM. Polling both descriptors keeps backpressure while
+    making those lifecycle events observable. A progress-based stall limit
+    applies only while bytes are waiting to be written; idle healthy streams
+    remain unlimited.
+    """
+    view = memoryview(data)
+    pipe_fd = stream.fileno()
+    client_fd = client.fileno()
+    poller = select.poll()
+    poller.register(pipe_fd, select.POLLOUT | select.POLLERR | select.POLLHUP)
+    client_flags = select.POLLERR | select.POLLHUP
+    client_flags |= getattr(select, "POLLRDHUP", 0)
+    poller.register(client_fd, client_flags)
+    last_progress = time.monotonic()
+
+    while view:
+        if cancel_requested.is_set():
+            raise InterruptedError("relay upload cancelled")
+        if process.poll() is not None:
+            raise BrokenPipeError("relay process exited during upload")
+        if time.monotonic() - last_progress >= PIPE_WRITE_STALL_TIMEOUT:
+            raise TimeoutError("relay stdin made no progress")
+
+        made_progress = False
+        for descriptor, event in poller.poll(PIPE_POLL_INTERVAL_MS):
+            if descriptor == client_fd:
+                if event & select.POLLERR:
+                    raise ConnectionError("client connection failed during upload")
+                if event & (select.POLLHUP | getattr(select, "POLLRDHUP", 0)):
+                    try:
+                        probe = client.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT)
+                    except BlockingIOError:
+                        probe = None
+                    except (ConnectionError, OSError):
+                        raise ConnectionError("client disconnected during upload")
+                    if probe == b"":
+                        raise ConnectionError("client disconnected during upload")
+            elif descriptor == pipe_fd:
+                if event & (select.POLLERR | select.POLLHUP):
+                    raise BrokenPipeError("relay stdin closed")
+                if event & select.POLLOUT:
+                    try:
+                        written = os.write(pipe_fd, view)
+                    except BlockingIOError:
+                        written = 0
+                    if written > 0:
+                        view = view[written:]
+                        last_progress = time.monotonic()
+                        made_progress = True
+        if not made_progress and view:
+            # POLLHUP can remain level-triggered while unread client bytes are
+            # still buffered. Avoid a busy loop until the pipe progresses,
+            # cancellation arrives, or the bounded write-stall limit expires.
+            time.sleep(0.01)
 
 
 def _executable_is_usable(candidate):
@@ -153,17 +216,18 @@ def start_windows_relay():
     )
 
 
-def pump_socket_to_process(client, process, first_chunk, finished):
+def pump_socket_to_process(client, process, first_chunk, finished, cancel_requested):
     try:
+        os.set_blocking(process.stdin.fileno(), False)
         if first_chunk:
-            write_all(process.stdin, first_chunk)
-            process.stdin.flush()
+            write_all_cancellable(process.stdin, first_chunk, client, process, cancel_requested)
         while True:
+            if cancel_requested.is_set():
+                break
             chunk = client.recv(65536)
             if not chunk:
                 break
-            write_all(process.stdin, chunk)
-            process.stdin.flush()
+            write_all_cancellable(process.stdin, chunk, client, process, cancel_requested)
     except (BrokenPipeError, ConnectionError, OSError, ValueError, socket.timeout):
         pass
     finally:
@@ -215,10 +279,11 @@ def reap_process(process):
         close_quietly(getattr(process, "stderr", None))
 
 
-def handle(client):
+def handle(client, stop_requested=None, register_process=None, finish_process=None):
     process = None
     upload = None
     download = None
+    cancel_requested = stop_requested or threading.Event()
     try:
         # This is the only read with a timeout. Once a client sends data, a
         # healthy streaming connection may remain open indefinitely.
@@ -239,6 +304,8 @@ def handle(client):
 
         try:
             process = start_windows_relay()
+            if register_process is not None:
+                register_process(process)
         except (OSError, RuntimeError) as exc:
             sys.stderr.write("dev-proxy: could not start Windows relay: %s\n" % exc)
             sys.stderr.flush()
@@ -248,7 +315,7 @@ def handle(client):
         download_done = threading.Event()
         upload = threading.Thread(
             target=pump_socket_to_process,
-            args=(client, process, first_chunk, upload_done),
+            args=(client, process, first_chunk, upload_done, cancel_requested),
             name="dev-proxy-upload",
             daemon=True,
         )
@@ -262,6 +329,8 @@ def handle(client):
         download.start()
 
         while True:
+            if cancel_requested.is_set():
+                break
             if download_done.wait(0.1):
                 break
             if upload_done.is_set():
@@ -278,7 +347,10 @@ def handle(client):
         except (OSError, ConnectionError):
             pass
         close_quietly(client)
-        reap_process(process)
+        if finish_process is not None and process is not None:
+            finish_process(process)
+        else:
+            reap_process(process)
         if upload is not None:
             upload.join(THREAD_JOIN_TIMEOUT)
         if download is not None:
@@ -292,11 +364,28 @@ def serve():
     connection_slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
     stop_requested = threading.Event()
     active_clients = set()
+    active_processes = {}
     active_lock = threading.Lock()
     workers = set()
 
     def request_stop(_signum, _frame):
         stop_requested.set()
+
+    def register_process(process):
+        with active_lock:
+            active_processes[process] = threading.Lock()
+
+    def finish_process(process):
+        with active_lock:
+            process_lock = active_processes.get(process)
+        if process_lock is None:
+            reap_process(process)
+            return
+        with process_lock:
+            reap_process(process)
+        with active_lock:
+            if active_processes.get(process) is process_lock:
+                active_processes.pop(process, None)
 
     signal.signal(signal.SIGTERM, request_stop)
     signal.signal(signal.SIGINT, request_stop)
@@ -321,7 +410,7 @@ def serve():
 
             def run_one(sock):
                 try:
-                    handle(sock)
+                    handle(sock, stop_requested, register_process, finish_process)
                 finally:
                     with active_lock:
                         active_clients.discard(sock)
@@ -341,12 +430,23 @@ def serve():
     with active_lock:
         clients = list(active_clients)
         pending_workers = list(workers)
+        processes = list(active_processes)
     for client in clients:
         try:
             client.shutdown(socket.SHUT_RDWR)
         except (OSError, ConnectionError):
             pass
         close_quietly(client)
+
+    # Stop all owned children together before waiting for workers. This closes
+    # their pipe ends and wakes uploads that were blocked by downstream
+    # backpressure. handle() remains the normal owner of final wait/close.
+    for process in processes:
+        if process.poll() is None:
+            try:
+                process.terminate()
+            except (OSError, ProcessLookupError):
+                pass
 
     # A stop signal must not leave relay children behind when daemon threads
     # are about to be discarded. Each handle() owns and reaps its child; wait
@@ -355,6 +455,16 @@ def serve():
     for worker in pending_workers:
         remaining = max(0.0, deadline - time.monotonic())
         worker.join(remaining)
+
+    # A worker should normally have removed its process from the registry. Any
+    # survivor is reaped through the same per-process lock before daemon exit.
+    with active_lock:
+        remaining_processes = list(active_processes)
+    for process in remaining_processes:
+        finish_process(process)
+    for worker in pending_workers:
+        if worker.is_alive():
+            worker.join(THREAD_JOIN_TIMEOUT)
 
 
 if __name__ == "__main__":
